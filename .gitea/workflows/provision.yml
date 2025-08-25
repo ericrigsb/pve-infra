@@ -1,0 +1,244 @@
+name: Provision
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'ansible/**'
+      - 'terraform/**'
+  pull_request_target:
+    types:
+      - closed
+    branches:
+      - main
+    paths:
+      - 'ansible/**'
+      - 'terraform/**'
+
+env:
+  TF_LOG: ERROR
+  TF_WORKSPACE: terraform-gitea-actions
+  TF_VAR_pm_api_url: ${{ vars.PM_API_URL }}
+  TF_VAR_pm_api_token_id: ${{ secrets.PM_API_TOKEN_ID }}
+  TF_VAR_pm_api_token_secret: ${{ secrets.PM_API_TOKEN_SECRET }}
+  TF_VAR_guest_root_password: ${{ secrets.GUEST_ROOT_PASSWORD }}
+  TF_VAR_pve_infra_ssh_key: ${{ secrets.PVE_INFRA_SSH_KEY }}
+  TF_VAR_pve_infra_ssh_public_key: ${{ secrets.PVE_INFRA_SSH_PUBLIC_KEY }}
+  GUEST_USER: ${{ vars.GUEST_USER }}
+  GUEST_USER_PASSWORD: ${{ secrets.GUEST_USER_PASSWORD }}
+  GUEST_USER_PUBLIC_KEY: ${{ secrets.GUEST_USER_PUBLIC_KEY }}
+  NORDVPN_AUTH_TOKEN: ${{ secrets.NORDVPN_AUTH_TOKEN }}
+
+jobs:
+  check-terraform:
+    name: Lint and Plan Terraform
+    runs-on: [ubuntu-latest]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: terraform-changes
+        run: |
+          if git diff --name-only origin/main..HEAD | grep -q '^terraform/'; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+
+      - name: Terraform Init
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.MINIO_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.MINIO_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.MINIO_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tf-state-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=main" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Validate
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform validate
+
+      - name: Terraform Plan
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform plan
+
+  check-ansible:
+    name: Lint Ansible
+    runs-on: [ansible-runner]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ansible changes
+        id: ansible-changes
+        run: |
+          if git diff --name-only origin/main..HEAD | grep -q '^ansible/'; then
+            echo "ansible_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ansible Lint
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          ansible-lint ansible/playbooks/
+
+  provision-terraform:
+    name: Provision Infrastructure
+    runs-on: [ubuntu-latest]
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    outputs:
+      terraform_changed: ${{ steps.terraform-changes.outputs.terraform_changed }}
+      ssh_key_path: ${{ steps.terraform_outputs.outputs.ssh_key_path }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: terraform-changes
+        run: |
+          if git diff --name-only origin/main~1..HEAD | grep -q '^terraform/'; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+
+      - name: Terraform Init
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.MINIO_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.MINIO_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.MINIO_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tf-state-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=main" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Plan
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform plan -refresh=true
+
+      - name: Terraform Apply
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform apply -auto-approve
+
+      - name: Get Terraform Outputs
+        id: terraform_outputs
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform output -json vms > vms.json
+          jq '[.[] | select(.vm_type != "talos")]' vms.json > non_talos_vms.json
+          echo "${{ secrets.PVE_INFRA_SSH_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+          echo "ssh_key_path=${PWD}/ssh_key.pem" >> "$GITHUB_OUTPUT"
+          terraform output -raw talosconfig > talosconfig
+          terraform output -raw kubeconfig > kubeconfig
+          echo "talosconfig:"
+          cat talosconfig
+          echo "kubeconfig:"
+          cat kubeconfig
+
+  provision-ansible:
+    name: Run Ansible
+    runs-on: [ansible-runner]
+    needs: provision-terraform
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ansible changes
+        id: ansible-changes
+        run: |
+          if git diff --name-only origin/main~1..HEAD | grep -q '^ansible/'; then
+            echo "ansible_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get SSH Key and VM Data
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          echo "${{ secrets.PVE_INFRA_SSH_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+
+      - name: Get Terraform Outputs for Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.MINIO_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.MINIO_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.MINIO_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tf-state-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=main" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+          terraform output -json vms > vms.json
+          jq '[.[] | select(.vm_type != "talos")]' vms.json > non_talos_vms.json
+
+      - name: Validate Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          chmod a+x ansible/ansible.sh
+          ansible/ansible.sh validate \
+            "${PWD}/ssh_key.pem" \
+            ./terraform/non_talos_vms.json
+
+      - name: Run Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          chmod a+x ansible/ansible.sh
+          ansible/ansible.sh provision \
+            "${PWD}/ssh_key.pem" \
+            ./terraform/non_talos_vms.json

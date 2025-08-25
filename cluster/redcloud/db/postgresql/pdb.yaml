@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgresql-pdb
+  namespace: postgresql
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: postgresql

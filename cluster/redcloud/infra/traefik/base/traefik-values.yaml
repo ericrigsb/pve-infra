@@ -1,0 +1,102 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-values
+  namespace: traefik
+data:
+  values.yaml: |
+    deployment:
+      replicas: 1
+      resources:
+        requests:
+          cpu: 150m
+          memory: 192Mi
+        limits:
+          cpu: 400m
+          memory: 512Mi
+
+    service:
+      enabled: true
+      type: LoadBalancer
+
+    ports:
+      traefik:
+        port: 9000
+        expose:
+          default: false
+        exposedPort: 9000
+      web:
+        port: 80
+        expose:
+          default: true
+        exposedPort: 80
+      websecure:
+        port: 443
+        expose:
+          default: true
+        exposedPort: 443
+      mailrise:
+        port: 8025
+        expose:
+          default: true
+        exposedPort: 8025
+      winbox:
+        port: 8291
+        expose:
+          default: true
+        exposedPort: 8291
+      unifi8080:
+        port: 8080
+        expose:
+          default: true
+        exposedPort: 8080
+      unifi8880:
+        port: 8880
+        expose:
+          default: true
+        exposedPort: 8880
+      unifi3478:
+        port: 3478
+        expose:
+          default: true
+        exposedPort: 3478
+        protocol: UDP
+      unifi10001:
+        port: 10001
+        expose:
+          default: true
+        exposedPort: 10001
+        protocol: UDP
+
+    entryPoints:
+      traefik:
+        address: ":9000"
+      web:
+        address: ":80"
+      websecure:
+        address: ":443"
+      mailrise:
+        address: ":8025"
+      winbox:
+        address: ":8291"
+      unifi8080:
+        address: ":8080"
+      unifi8880:
+        address: ":8880"
+      unifi3478:
+        address: ":3478/udp"
+      unifi10001:
+        address: ":10001/udp"
+
+    providers:
+      kubernetesCRD:
+        enabled: true
+      kubernetesIngress:
+        enabled: true
+        publishedService:
+          enabled: true
+
+    additionalArguments:
+      - "--providers.kubernetescrd.allowCrossNamespace=true"
+      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"

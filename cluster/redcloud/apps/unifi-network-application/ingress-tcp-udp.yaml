@@ -1,0 +1,60 @@
+# 8080 TCP
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: unifi-8080
+  namespace: unifi-network-application
+spec:
+  entryPoints:
+    - unifi8080
+  routes:
+    - match: HostSNI(`*`)
+      services:
+        - name: unifi-network-application
+          port: 8080
+
+---
+# 8880 TCP
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: unifi-8880
+  namespace: unifi-network-application
+spec:
+  entryPoints:
+    - unifi8880
+  routes:
+    - match: HostSNI(`*`)
+      services:
+        - name: unifi-network-application
+          port: 8880
+
+---
+# 3478 UDP
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: unifi-3478
+  namespace: unifi-network-application
+spec:
+  entryPoints:
+    - unifi3478
+  routes:
+    - services:
+        - name: unifi-network-application
+          port: 3478
+
+---
+# 10001 UDP
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteUDP
+metadata:
+  name: unifi-10001
+  namespace: unifi-network-application
+spec:
+  entryPoints:
+    - unifi10001
+  routes:
+    - services:
+        - name: unifi-network-application
+          port: 10001

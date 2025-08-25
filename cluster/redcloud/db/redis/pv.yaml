@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: redis-static-pv
+spec:
+  capacity:
+    storage: 8Gi
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    path: /mnt/share/k8s/redis-data-redis-master-0-pv
+    server: 10.0.4.10
+  persistentVolumeReclaimPolicy: Retain

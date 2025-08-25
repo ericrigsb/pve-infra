@@ -1,0 +1,15 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - helmrepository.yaml
+  - namespace.yaml
+  - pv.yaml
+  - pvc.yaml
+  - ext-lib-pv.yaml
+  - initdb-job.yaml
+  - helmrelease.yaml
+  - service.yaml
+  - backup-job.yaml
+  - certificate.yaml
+  - ingress.yaml
+  - pdb.yaml

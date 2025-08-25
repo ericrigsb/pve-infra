@@ -1,0 +1,10 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: websockets-headers
+  namespace: traefik
+spec:
+  headers:
+    customRequestHeaders:
+      Upgrade: "websocket"
+      Connection: "Upgrade"

@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: immich-initdb
+  namespace: immich
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: initdb
+          image: postgres:14
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: immich-db-secret
+                  key: postgres-password
+          command: ["sh", "-c"]
+          args:
+            - |
+              psql -h postgresql.postgresql.svc.cluster.local -U postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'immich'" | grep -q 1 || \
+              psql -h postgresql.postgresql.svc.cluster.local -U postgres -c "CREATE DATABASE immich"
