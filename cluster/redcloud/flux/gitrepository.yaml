@@ -1,0 +1,12 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: pve-infra
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  url: ssh://gitea@gitea/eric/pve-infra.git
+  secretRef:
+    name: flux-ssh-auth
+  ref:
+    branch: main

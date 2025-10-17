@@ -1,0 +1,97 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: uptime-kuma-backup
+  namespace: uptime-kuma
+  labels:
+    app: uptime-kuma-backup
+spec:
+  schedule: "15 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          imagePullSecrets:
+          - name: gitea-registry
+          containers:
+          - name: uptime-kuma-backup
+            image: gitea.mesh.rigsb.net/eric/backup-runner:latest
+            env:
+            - name: RESTIC_CACHE_DIR
+              value: "/tmp"
+            - name: RESTIC_PASSWORD_FILE
+              value: "/etc/restic-secret/password"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              source /scripts/backup-service.sh
+              backup_service "Uptime Kuma" "/backup/k8s-uptime-kuma" "/app/data/kuma.db"
+            volumeMounts:
+            - name: uptime-kuma-data
+              mountPath: /app/data
+              readOnly: true
+            - name: restic-secret
+              mountPath: /etc/restic-secret
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+            - name: backup-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+          serviceAccountName: uptime-kuma-backup-sa
+          volumes:
+          - name: uptime-kuma-data
+            persistentVolumeClaim:
+              claimName: uptime-kuma-pv-claim
+          - name: restic-secret
+            secret:
+              secretName: restic-secret
+          - name: backup-storage
+            nfs:
+              server: 10.0.4.8
+              path: /mnt/backup
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: uptime-kuma-backup-sa
+  namespace: uptime-kuma
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-secrets-reader
+  namespace: uptime-kuma
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: uptime-kuma-backup-secrets-binding
+  namespace: uptime-kuma
+subjects:
+- kind: ServiceAccount
+  name: uptime-kuma-backup-sa
+  namespace: uptime-kuma
+roleRef:
+  kind: Role
+  name: backup-secrets-reader
+  apiGroup: rbac.authorization.k8s.io

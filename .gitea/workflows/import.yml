@@ -1,0 +1,54 @@
+name: Plan Import
+
+on:
+  push:
+    branches:
+      - feature/*import*
+    paths:
+      - 'terraform/**'
+
+env:
+  TF_LOG: INFO
+  TF_WORKSPACE: terraform-gitea-actions
+  TF_VAR_pm_api_url: ${{ vars.PM_API_URL }}
+  TF_VAR_pm_api_token_id: ${{ secrets.PM_API_TOKEN_ID }}
+  TF_VAR_pm_api_token_secret: ${{ secrets.PM_API_TOKEN_SECRET }}
+  TF_VAR_guest_root_password: ${{ secrets.GUEST_ROOT_PASSWORD }}
+  TF_VAR_pve_infra_ssh_key: ${{ secrets.PVE_INFRA_SSH_KEY }}
+  TF_VAR_pve_infra_ssh_public_key: ${{ secrets.PVE_INFRA_SSH_PUBLIC_KEY }}
+
+jobs:
+  plan-import:
+    name: Plan Import
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terrform Init
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.MINIO_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.MINIO_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.MINIO_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tf-state-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=main" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Validate
+        run: |
+          cd ./terraform
+          terraform validate
+
+      - name: Terraform Plan
+        run: |
+          cd ./terraform
+          terraform plan -generate-config-out=generated_resources.tf

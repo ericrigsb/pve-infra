@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openspeedtest
+  namespace: openspeedtest
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openspeedtest
+  template:
+    metadata:
+      labels:
+        app: openspeedtest
+    spec:
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+      containers:
+        - name: openspeedtest
+          image: openspeedtest/latest:v2.0.6
+          ports:
+            - containerPort: 3000
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

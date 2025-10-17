@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: modem-cert
+  namespace: modem
+spec:
+  secretName: modem-mesh-rigsb-net-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: modem.mesh.rigsb.net
+  dnsNames:
+    - modem.mesh.rigsb.net

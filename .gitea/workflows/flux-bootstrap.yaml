@@ -1,0 +1,138 @@
+name: FluxCD Bootstrap PR
+
+on:
+  workflow_dispatch: {}
+
+env:
+  KUBECONFIG_PATH: /tmp/kubeconfig
+  FLUX_SSH_KEY_PATH: /tmp/flux_ssh_key
+  SSH_KNOWN_HOSTS_PATH: /tmp/known_hosts
+  FLUX_REPO_URL: ${{ vars.GIT_REPO_URL }}
+  FLUX_REPO_BRANCH: main
+  FLUX_BOOTSTRAP_BRANCH: flux-bootstrap
+  FLUX_REPO_PATH: ${{ vars.BOOTSTRAP_PATH }}
+  FLUX_NAMESPACE: flux-system
+
+jobs:
+  bootstrap_flux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup kubeconfig
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > $KUBECONFIG_PATH
+          chmod 600 $KUBECONFIG_PATH
+
+      - name: Install Flux CLI
+        run: |
+          curl -s https://fluxcd.io/install.sh | sudo bash
+
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+
+      - name: Setup SSH key and known_hosts
+        run: |
+          echo "${{ secrets.FLUX_SSH_PRIVATE_KEY }}" | base64 -d > $FLUX_SSH_KEY_PATH
+          chmod 600 $FLUX_SSH_KEY_PATH
+          mkdir -p ~/.ssh
+          ssh-keyscan ${{ vars.FLUX_REPO_HOST }} > $SSH_KNOWN_HOSTS_PATH
+
+      - name: Checkout or create bootstrap branch
+        run: |
+          git config user.name "Flux Bot"
+          git config user.email "flux@gitea.local"
+          git fetch origin
+          git switch -C $FLUX_BOOTSTRAP_BRANCH
+
+      - name: Generate Flux bootstrap manifests
+        run: |
+          mkdir -p $FLUX_REPO_PATH
+
+          cat <<EOF > $FLUX_REPO_PATH/gitrepository.yaml
+          apiVersion: source.toolkit.fluxcd.io/v1
+          kind: GitRepository
+          metadata:
+            name: pve-infra
+            namespace: $FLUX_NAMESPACE
+          spec:
+            interval: 1m0s
+            url: ${{ env.FLUX_REPO_URL }}
+            secretRef:
+              name: flux-ssh-auth
+            ref:
+              branch: ${{ env.FLUX_REPO_BRANCH }}
+          EOF
+
+          cat <<EOF > $FLUX_REPO_PATH/kustomization-apps.yaml
+          apiVersion: kustomize.toolkit.fluxcd.io/v1
+          kind: Kustomization
+          metadata:
+            name: apps
+            namespace: $FLUX_NAMESPACE
+          spec:
+            interval: 5m0s
+            path: cluster/redcloud/apps
+            prune: true
+            sourceRef:
+              kind: GitRepository
+              name: pve-infra
+          EOF
+
+      - name: Commit and push bootstrap manifests
+        run: |
+          git add $FLUX_REPO_PATH
+          git commit -m "Add Flux bootstrap manifests" || echo "No changes to commit"
+          git push origin $FLUX_BOOTSTRAP_BRANCH --force
+
+      - name: Install Flux components (no push to main)
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        run: |
+          flux install \
+            --namespace=$FLUX_NAMESPACE \
+            --components=source-controller,kustomize-controller,notification-controller,image-reflector-controller,image-automation-controller,helm-controller
+
+      - name: Create flux-ssh-auth Kubernetes secret
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG_PATH }}
+        run: |
+          kubectl create secret generic flux-ssh-auth \
+            --namespace=$FLUX_NAMESPACE \
+            --from-file=identity=$FLUX_SSH_KEY_PATH \
+            --from-file=ssh-privatekey=$FLUX_SSH_KEY_PATH \
+            --from-file=known_hosts=$SSH_KNOWN_HOSTS_PATH \
+            --type=kubernetes.io/ssh-auth \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply GitRepository and Kustomizations
+        run: |
+          kubectl --kubeconfig=$KUBECONFIG_PATH apply -f $FLUX_REPO_PATH/
+
+      - name: Create or update PR to main
+        env:
+          GITEA_TOKEN: ${{ secrets.FLUX_GITEA_TOKEN }}
+        run: |
+          PR_EXISTS=$(curl -s -H "Authorization: token $GITEA_TOKEN" \
+            "${{ vars.API_URL }}/repos/${{ vars.FLUX_REPO_OWNER }}/pve-infra/pulls?state=open" | jq -r --arg head "$FLUX_BOOTSTRAP_BRANCH" '.[] | select(.head.ref==$head) | .id')
+
+          if [ -z "$PR_EXISTS" ]; then
+            curl -X POST "${{ vars.API_URL }}/repos/${{ vars.FLUX_REPO_OWNER }}/pve-infra/pulls" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -d '{
+                "base": "main",
+                "head": "'"$FLUX_BOOTSTRAP_BRANCH"'",
+                "title": "FluxCD Bootstrap Manifests",
+                "body": "Automated PR to bootstrap FluxCD"
+              }'
+          else
+            echo "PR already exists: $PR_EXISTS"
+          fi

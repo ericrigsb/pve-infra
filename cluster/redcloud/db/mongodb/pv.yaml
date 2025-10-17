@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mongodb-static-pv
+spec:
+  capacity:
+    storage: 8Gi
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    path: /mnt/share/k8s/mongodb-pv
+    server: 10.0.4.10
+  persistentVolumeReclaimPolicy: Retain

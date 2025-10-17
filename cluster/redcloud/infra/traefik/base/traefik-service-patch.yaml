@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik
+  namespace: traefik
+  annotations:
+    external-dns.alpha.kubernetes.io/hostname: traefik.mesh.rigsb.net
+spec:
+  loadBalancerIP: 10.0.4.100
+  externalTrafficPolicy: Local

@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: router-external
+  namespace: router
+spec:
+  clusterIP: None
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: winbox
+      port: 8291
+      targetPort: 8291
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: router-external
+  namespace: router
+subsets:
+  - addresses:
+      - ip: 10.0.4.1
+    ports:
+      - name: http
+        port: 80
+      - name: winbox
+        port: 8291

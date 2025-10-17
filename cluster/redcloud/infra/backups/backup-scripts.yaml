@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backup-scripts
+  namespace: backups
+data:
+  backup-service.sh: |
+    #!/bin/bash
+    set -e
+    
+    # Function to send notifications
+    send_notification() {
+      local subject="$1"
+      local body="$2"
+      
+      # Use cached webhook URL or get it fresh if not cached
+      local SLACK_WEBHOOK="${CACHED_WEBHOOK}"
+      if [ -z "$SLACK_WEBHOOK" ]; then
+        SLACK_WEBHOOK=$(kubectl get secret slack-webhook -o jsonpath='{.data.webhook-url}' 2>/dev/null | base64 -d 2>/dev/null)
+      fi
+      
+      # Validate webhook URL before using
+      if [ -n "$SLACK_WEBHOOK" ] && [ ${#SLACK_WEBHOOK} -gt 20 ]; then
+        # Send direct to Slack webhook
+        curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"$subject\\n$body\"}" \
+          "$SLACK_WEBHOOK" || true
+      else
+        echo "Warning: Slack webhook URL is empty or invalid, skipping notification"
+      fi
+    }
+    
+    # Function to backup a single service
+    backup_service() {
+      local service_name="$1"
+      local repo_path="$2"
+      local backup_paths="$3"
+      local pre_backup_cmd="${4:-}"
+      local post_backup_cmd="${5:-}"
+      
+      # Cache webhook URL once at the start to avoid kubectl API cache issues
+      export CACHED_WEBHOOK=$(kubectl get secret slack-webhook -o jsonpath='{.data.webhook-url}' 2>/dev/null | base64 -d 2>/dev/null)
+      
+      echo "=== Starting $service_name backup at $(date) ==="
+      send_notification "🔄 $service_name Backup Started" "$service_name backup started at $(date)"
+      
+      # Set repository for this service
+      export RESTIC_REPOSITORY="$repo_path"
+      
+      # Initialize repository if it doesn't exist
+      restic cat config || restic init
+      
+       # Run pre-backup command if provided
+      if [ -n "$pre_backup_cmd" ]; then
+        echo "Running pre-backup command for $service_name..."
+        if $pre_backup_cmd; then
+          echo "✅ Pre-backup command completed successfully"
+        else
+          echo "❌ Pre-backup command failed"
+        fi
+      fi
+      
+      # Unlock repository in case of stale locks from previous failed jobs
+      echo "Checking for repository locks..."
+      restic unlock || true
+
+      # Perform backup
+      local backup_success=true
+      if restic backup $backup_paths \
+        --tag $(echo "$service_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-') \
+        --tag daily \
+        --host k8s-cluster; then
+        
+        # Cleanup old backups (keep 7 daily, 4 weekly, 1 monthly)
+        restic forget \
+          --keep-daily 7 \
+          --keep-weekly 4 \
+          --keep-monthly 1 \
+          --tag $(echo "$service_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-') \
+          --prune
+        
+        echo "✅ $service_name backup completed successfully at $(date)"
+      else
+        backup_success=false
+        echo "❌ $service_name backup failed at $(date)"
+      fi
+      
+      # Run post-backup command if provided
+      if [ -n "$post_backup_cmd" ]; then
+        echo "Running post-backup command for $service_name..."
+        if $post_backup_cmd; then
+          echo "✅ Post-backup command completed successfully"
+        else
+          echo "❌ Post-backup command failed"
+        fi
+      fi
+      
+      # Send completion notification
+      if [ "$backup_success" = true ]; then
+        send_notification "✅ $service_name Backup Complete" "$service_name backup completed successfully at $(date)"
+        exit 0
+      else
+        send_notification "❌ $service_name Backup Failed" "$service_name backup failed at $(date)"
+        exit 1
+      fi
+    }

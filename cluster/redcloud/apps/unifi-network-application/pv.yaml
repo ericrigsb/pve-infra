@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: unifi-config-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  nfs:
+    path: /mnt/share/k8s/unifi-config-pv
+    server: 10.0.4.10
+  persistentVolumeReclaimPolicy: Retain

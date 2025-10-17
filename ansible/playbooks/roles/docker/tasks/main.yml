@@ -1,0 +1,11 @@
+- name: Hold Docker packages to prevent upgrade
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - docker-ce
+    - docker-ce-cli
+    - docker-ce-rootless-extras
+    - containerd.io
+    - docker-compose-plugin
+  failed_when: false

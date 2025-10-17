@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nutweb
+  namespace: nutweb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nutweb
+  template:
+    metadata:
+      labels:
+        app: nutweb
+    spec:
+      containers:
+        - name: nutweb
+          image: ghcr.io/superioone/nut_webgui:latest
+          envFrom:
+            - secretRef:
+                name: nutweb-secret
+          env:
+            - name: UPSD_ADDR
+              value: "192.168.187.7"
+            - name: UPSD_PORT
+              value: "3493"
+            - name: POLL_FREQ
+              value: "20"
+          resources:
+            limits:
+              memory: "64Mi"
+              cpu: "250m"
+            requests:
+              memory: "32Mi"
+              cpu: "100m"
+          ports:
+            - containerPort: 9000
+          startupProbe:
+            httpGet:
+              path: /probes/readiness
+              port: 9000
+            initialDelaySeconds: 5
+            failureThreshold: 15
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /probes/health
+              port: 9000
+            initialDelaySeconds: 5
+            failureThreshold: 3
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /probes/readiness
+              port: 9000
+            initialDelaySeconds: 5
+            failureThreshold: 3
+            periodSeconds: 30

@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailrise
+  namespace: mailrise
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mailrise
+  template:
+    metadata:
+      labels:
+        app: mailrise
+    spec:
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+      containers:
+        - name: mailrise
+          image: yoryan/mailrise:latest
+          ports:
+            - containerPort: 8025
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          env:
+            - name: SLACK_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mailrise-slack
+                  key: SLACK_API_URL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mailrise.conf
+              subPath: mailrise.conf
+      volumes:
+        - name: config
+          configMap:
+            name: mailrise-config

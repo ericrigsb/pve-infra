@@ -1,0 +1,69 @@
+apiVersion: helm.toolkit.fluxcd.io/v2beta2
+kind: HelmRelease
+metadata:
+  name: immich
+  namespace: immich
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: immich
+      version: 0.9.3
+      sourceRef:
+        kind: HelmRepository
+        name: immich
+        namespace: flux-system
+      interval: 1h
+  values:
+    env:
+      DB_HOSTNAME: postgresql.postgresql.svc.cluster.local
+      DB_USERNAME: postgres
+      DB_PASSWORD:
+        valueFrom:
+          secretKeyRef:
+            name: immich-db-secret
+            key: postgres-password
+            optional: false
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis-master.redis.svc.cluster.local
+      REDIS_PASSWORD:
+        valueFrom:
+          secretKeyRef:
+            name: immich-db-secret
+            key: redis-password
+            optional: false
+    image:
+      tag: v2.1.0
+    immich:
+      persistence:
+        library:
+          enabled: true
+          existingClaim: immich-library-pvc
+    server:
+      enabled: true
+      resources:
+        requests:
+          cpu: 500m
+          memory: 1Gi
+        limits:
+          cpu: 1.3
+          memory: 2.2Gi
+      persistence:
+        externals:
+          enabled: true
+          existingClaim: ext-lib-pvc
+          mountPath: /osxphotos
+          readOnly: true
+    machine-learning:
+      enabled: true
+      resources:
+        requests:
+          cpu: 300m
+          memory: 800Mi
+        limits:
+          cpu: 800m
+          memory: 1.8Gi
+      persistence:
+        cache:
+          enabled: true
+          existingClaim: immich-ml-cache-pvc

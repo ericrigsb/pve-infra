@@ -1,0 +1,32 @@
+proxy_nordvpn_user: "eric"
+proxy_vpn_interface: "nordlynx"
+proxy_main_interface: "eth1"
+proxy_servers_interface: "eth0"
+proxy_internal_forward_ip: "10.0.4.100"
+proxy_nordvpn_auth_token: "{{ lookup('env', 'NORDVPN_AUTH_TOKEN') }}"
+proxy_nordvpn_meshnet_nickname: proxy
+proxy_nordvpn_meshnet_peers:
+  - name: lauras-iphone
+    permissions:
+      - incoming
+      - fileshare
+      - local
+      - routing
+  - name: erics-iphone
+    permissions:
+      - incoming
+      - fileshare
+      - local
+      - routing
+  - name: erics-ipad
+    permissions:
+      - incoming
+      - fileshare
+      - local
+      - routing
+  - name: erics-mbp
+    permissions:
+      - incoming
+      - fileshare
+      - local
+      - routing

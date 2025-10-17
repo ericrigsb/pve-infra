@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: grant-unifi-roles
+  namespace: mongodb
+spec:
+  template:
+    spec:
+      containers:
+        - name: mongo
+          image: bitnami/mongodb:latest
+          env:
+            - name: MONGODB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongodb-auth
+                  key: mongodb-root-password
+            - name: UNIFI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: unifi-db-secret
+                  key: password
+          command:
+            - /bin/bash
+            - -c
+            - |
+              mongosh "mongodb://root:$MONGODB_ROOT_PASSWORD@mongodb.mongodb.svc.cluster.local:27017/admin" <<EOF
+              use admin
+              db.getUser("unifi") ?
+                db.updateUser("unifi", {pwd: "$UNIFI_PASSWORD", roles: [
+                  {role: "dbOwner", db: "unifi"},
+                  {role: "dbOwner", db: "unifi_stat"},
+                  {role: "dbOwner", db: "unifi_audit"}
+                ]}) :
+                db.createUser({user: "unifi", pwd: "$UNIFI_PASSWORD", roles: [
+                  {role: "dbOwner", db: "unifi"},
+                  {role: "dbOwner", db: "unifi_stat"},
+                  {role: "dbOwner", db: "unifi_audit"}
+                ]});
+              use unifi
+              db.getUser("unifi") ?
+                db.updateUser("unifi", {pwd: "$UNIFI_PASSWORD", roles: [
+                  {role: "dbOwner", db: "unifi"},
+                  {role: "dbOwner", db: "unifi_stat"},
+                  {role: "dbOwner", db: "unifi_audit"}
+                ]}) :
+                db.createUser({user: "unifi", pwd: "$UNIFI_PASSWORD", roles: [
+                  {role: "dbOwner", db: "unifi"},
+                  {role: "dbOwner", db: "unifi_stat"},
+                  {role: "dbOwner", db: "unifi_audit"}
+                ]});
+              EOF
+      restartPolicy: OnFailure

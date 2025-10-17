@@ -1,0 +1,41 @@
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  notify: Upgrade all packages
+
+- name: Ensure sudo is installed
+  ansible.builtin.apt:
+    name: sudo
+    state: present
+
+- name: Ensure the user exists
+  ansible.builtin.user:
+    name: "{{ common_username }}"
+    password: "{{ common_password | password_hash('sha512') }}"
+    shell: /bin/bash
+    groups: sudo
+    append: true
+    state: present
+    create_home: true
+
+- name: Set authorized key for user
+  ansible.posix.authorized_key:
+    user: "{{ common_username }}"
+    state: present
+    key: "{{ common_ssh_pub_key }}"
+    path: "/home/{{ common_username }}/.ssh/authorized_keys"
+
+- name: Disable password authentication in SSH
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    state: present
+    backup: true
+
+- name: Restart SSH
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+    enabled: true
