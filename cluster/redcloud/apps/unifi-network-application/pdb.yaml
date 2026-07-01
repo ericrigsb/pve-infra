@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: unifi-network-application-pdb
+  namespace: unifi-network-application
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: unifi-network-application

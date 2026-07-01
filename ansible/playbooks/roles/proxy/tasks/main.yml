@@ -1,0 +1,194 @@
+- name: Enable IPv4 Forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: '1'
+    sysctl_set: true
+    state: present
+    reload: true
+
+- name: Ensure required packages are installed
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg2
+      - lsb-release
+    state: present
+    update_cache: true
+
+- name: Add NordVPN GPG key
+  ansible.builtin.apt_key:
+    url: https://repo.nordvpn.com/gpg/nordvpn_public.asc
+    state: present
+
+- name: Add NordVPN APT repository
+  ansible.builtin.apt_repository:
+    repo: "deb https://repo.nordvpn.com/deb/nordvpn/debian stable main"
+    state: present
+    filename: nordvpn
+
+- name: Update APT cache
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Install NordVPN
+  ansible.builtin.apt:
+    name: nordvpn
+    state: present
+    install_recommends: false
+    update_cache: true
+
+- name: Add user to nordvpn group
+  ansible.builtin.user:
+    name: "{{ proxy_nordvpn_user }}"
+    groups: nordvpn
+    append: true
+
+- name: Ensure iptables-persistent is installed
+  ansible.builtin.apt:
+    name: iptables-persistent
+    state: present
+    update_cache: true
+
+- name: Flush all iptables rules and delete user chains
+  become: true
+  ansible.builtin.shell: |
+    iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X && iptables -t mangle -F && iptables -t mangle -X
+  changed_when: false
+
+- name: Enable NAT for VPN interface
+  ansible.builtin.iptables:
+    table: nat
+    chain: POSTROUTING
+    out_interface: "{{ proxy_vpn_interface }}"
+    jump: MASQUERADE
+    state: present
+    comment: "Masquerade traffic going out {{ proxy_vpn_interface }}"
+  notify: Save iptables rules
+
+- name: Allow established traffic from VPN to main interface
+  ansible.builtin.iptables:
+    chain: FORWARD
+    out_interface: "{{ proxy_vpn_interface }}"
+    in_interface: "{{ proxy_main_interface }}"
+    match: state
+    ctstate: RELATED,ESTABLISHED
+    jump: ACCEPT
+    state: present
+    comment: "Allow related/established traffic from {{ proxy_main_interface }} to {{ proxy_vpn_interface }}"
+  notify: Save iptables rules
+
+- name: Allow established traffic from VPN to servers interface
+  ansible.builtin.iptables:
+    chain: FORWARD
+    out_interface: "{{ proxy_vpn_interface }}"
+    in_interface: "{{ proxy_servers_interface }}"
+    match: state
+    ctstate: RELATED,ESTABLISHED
+    jump: ACCEPT
+    state: present
+    comment: "Allow related/established traffic from {{ proxy_servers_interface }} to {{ proxy_vpn_interface }}"
+  notify: Save iptables rules
+
+- name: Allow forwarding from VPN to main interface
+  ansible.builtin.iptables:
+    chain: FORWARD
+    out_interface: "{{ proxy_main_interface }}"
+    in_interface: "{{ proxy_vpn_interface }}"
+    jump: ACCEPT
+    state: present
+    comment: "Allow traffic from {{ proxy_vpn_interface }} to {{ proxy_main_interface }}"
+  notify: Save iptables rules
+
+- name: Allow forwarding from VPN to servers interface
+  ansible.builtin.iptables:
+    chain: FORWARD
+    out_interface: "{{ proxy_servers_interface }}"
+    in_interface: "{{ proxy_vpn_interface }}"
+    jump: ACCEPT
+    state: present
+    comment: "Allow traffic from {{ proxy_vpn_interface }} to {{ proxy_servers_interface }}"
+  notify: Save iptables rules
+
+- name: Check if NordVPN CONNMARK rule exists for main interface
+  ansible.builtin.command: >
+    iptables -t mangle -C PREROUTING -i {{ proxy_main_interface }} -m comment --comment nord-router -j CONNMARK --set-xmark 0xe1f1/0xffffffff
+  register: check_connmark_main
+  failed_when: false
+  changed_when: false
+
+- name: Check if NordVPN CONNMARK rule exists for servers interface
+  ansible.builtin.command: >
+    iptables -t mangle -C PREROUTING -i {{ proxy_servers_interface }} -m comment --comment nord-router -j CONNMARK --set-xmark 0xe1f1/0xffffffff
+  register: check_connmark_servers
+  failed_when: false
+  changed_when: false
+
+- name: Add NordVPN CONNMARK rule for main interface
+  ansible.builtin.command: >
+    iptables -t mangle -A PREROUTING -i {{ proxy_main_interface }} -m comment --comment nord-router -j CONNMARK --set-xmark 0xe1f1/0xffffffff
+  when: check_connmark_main.rc != 0
+  changed_when: true
+  notify: Save iptables rules
+
+- name: Add NordVPN CONNMARK rule for servers interface
+  ansible.builtin.command: >
+    iptables -t mangle -A PREROUTING -i {{ proxy_servers_interface }} -m comment --comment nord-router -j CONNMARK --set-xmark 0xe1f1/0xffffffff
+  when: check_connmark_servers.rc != 0
+  changed_when: true
+  notify: Save iptables rules
+
+- name: Log in to NordVPN using token
+  become: true
+  become_user: "{{ proxy_nordvpn_user }}"
+  ansible.builtin.command: nordvpn login --token {{ proxy_nordvpn_auth_token }}
+  register: login_result
+  changed_when: "'welcome' in ((login_result.stdout | default('')) | lower)"
+  failed_when: >
+    login_result.rc != 0 and
+    'already logged in' not in
+    (((login_result.stdout | default('')) ~ ' ' ~ (login_result.stderr | default(''))) | lower)
+
+- name: Define NordVPN settings
+  ansible.builtin.set_fact:
+    nordvpn_settings:
+      - { option: technology, value: "NordLynx" }
+      - { option: lan-discovery, value: "enable" }
+      - { option: threatprotectionlite, value: "on" }
+      - { option: analytics, value: "off" }
+      - { option: killswitch, value: "off" }
+      - { option: notify, value: "off" }
+      - { option: tray, value: "off" }
+      - { option: autoconnect, value: "on United_States" }
+      - { option: meshnet, value: "off" }
+
+- name: Apply NordVPN settings
+  become: true
+  become_user: "{{ proxy_nordvpn_user }}"
+  ansible.builtin.command: >
+    nordvpn set {{ item.option }} {{ item.value }}
+  register: nordvpn_setting_result
+  loop: "{{ nordvpn_settings }}"
+  loop_control:
+    label: "{{ item.option }}={{ item.value }}"
+  changed_when: "'already' not in (((nordvpn_setting_result.stdout | default('')) ~ ' ' ~ (nordvpn_setting_result.stderr | default(''))) | lower)"
+  failed_when: >
+    nordvpn_setting_result.rc != 0 and
+    'already' not in
+    (((nordvpn_setting_result.stdout | default('')) ~ ' ' ~ (nordvpn_setting_result.stderr | default(''))) | lower)
+
+- name: Get NordVPN status
+  become: true
+  become_user: "{{ proxy_nordvpn_user }}"
+  ansible.builtin.command: nordvpn status
+  register: nord_status
+  changed_when: false
+  failed_when: false
+
+- name: Connect to NordVPN (US)
+  become: true
+  become_user: "{{ proxy_nordvpn_user }}"
+  ansible.builtin.command: nordvpn connect us
+  register: connect_result
+  when: "'status: connected' not in ((nord_status.stdout | default('')) | lower)"
+  changed_when: true
+  failed_when: connect_result.rc != 0

@@ -1,0 +1,57 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: mongodb
+  namespace: mongodb
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: mongodb
+      version: "16.5.27"
+      sourceRef:
+        kind: HelmRepository
+        name: bitnami-oci
+        namespace: flux-system
+  values:
+    global:
+        security:
+          allowInsecureImages: true
+    image:
+      registry: docker.io
+      repository: bitnamilegacy/mongodb
+      tag: 8.0.13-debian-12-r0
+    architecture: standalone
+    useStatefulSet: true
+    replicaCount: 1
+    auth:
+      existingSecret: mongodb-auth
+      usernames:
+        - unifi
+        - unifi
+        - unifi
+      databases:
+        - unifi
+        - unifi_stat
+        - unifi_audit
+    updateStrategy:
+      type: RollingUpdate
+    persistence:
+      enabled: true
+      existingClaim: mongodb-static-pvc
+    resources:
+      requests:
+        cpu: 700m
+        memory: 1152Mi
+      limits:
+        cpu: 1400m
+        memory: 2150Mi
+    tolerations:
+      - key: node.kubernetes.io/not-ready
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300
+      - key: node.kubernetes.io/unreachable
+        operator: Exists
+        effect: NoExecute
+        tolerationSeconds: 300

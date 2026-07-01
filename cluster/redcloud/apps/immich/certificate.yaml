@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: immich-cert
+  namespace: immich
+spec:
+  secretName: immich-mesh-rigsb-net-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: immich.mesh.rigsb.net
+  dnsNames:
+    - immich.mesh.rigsb.net

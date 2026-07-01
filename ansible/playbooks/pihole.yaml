@@ -1,0 +1,4 @@
+- name: Pihole
+  hosts: all
+  roles:
+    - community-script

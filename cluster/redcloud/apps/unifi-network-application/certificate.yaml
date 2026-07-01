@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: unifi-network-application-cert
+  namespace: unifi-network-application
+spec:
+  secretName: unifi-mesh-rigsb-net-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: unifi.mesh.rigsb.net
+  dnsNames:
+    - unifi.mesh.rigsb.net

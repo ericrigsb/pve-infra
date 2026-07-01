@@ -1,0 +1,4 @@
+- name: Streamer
+  hosts: all
+  roles:
+    - common

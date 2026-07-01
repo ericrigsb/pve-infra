@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: openspeedtest-cert
+  namespace: openspeedtest
+spec:
+  secretName: openspeedtest-mesh-rigsb-net-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: openspeedtest.mesh.rigsb.net
+  dnsNames:
+    - openspeedtest.mesh.rigsb.net

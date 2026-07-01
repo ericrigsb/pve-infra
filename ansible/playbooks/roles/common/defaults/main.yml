@@ -1,0 +1,3 @@
+common_username: "{{ lookup('env', 'GUEST_USER') }}"
+common_password: "{{ lookup('env', 'GUEST_USER_PASSWORD') }}"
+common_ssh_pub_key: "{{ lookup('env', 'GUEST_USER_PUBLIC_KEY') }}"

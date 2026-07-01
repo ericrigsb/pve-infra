@@ -1,0 +1,73 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: nextcloud
+  namespace: nextcloud
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: nextcloud
+      version: 9.1.3
+      sourceRef:
+        kind: HelmRepository
+        name: nextcloud
+        namespace: flux-system
+  values:
+    image:
+      repository: nextcloud
+      flavor: apache
+    phpClientHttpsFix:
+      enabled: true
+      protocol: https
+    nextcloud:
+      host: nextcloud.mesh.rigsb.net
+      configs:
+        override.config.php: |
+          <?php
+          $CONFIG = array (
+            'overwrite.cli.url' => 'https://nextcloud.mesh.rigsb.net',
+            'overwriteprotocol' => 'https',
+            'trusted_proxies' => ['10.0.0.0/8'],
+            'maintenance_window_start' => 6,
+            'maintenance' => false,
+          );
+      resources:
+        requests:
+          cpu: 450m
+          memory: 768Mi
+        limits:
+          cpu: 1050m
+          memory: 1.5Gi
+    internalDatabase:
+      enabled: false
+    externalDatabase:
+      enabled: true
+      type: postgresql
+      host: postgresql.postgresql.svc.cluster.local
+      database: nextcloud
+    redis:
+      enabled: false
+    persistence:
+      enabled: true
+      existingClaim: nextcloud-pvc
+    imaginary:
+      enabled: true
+      resources:
+        requests:
+          cpu: 250m
+          memory: 320Mi
+        limits:
+          cpu: 500m
+          memory: 640Mi
+    startupProbe:
+      enabled: false
+    livenessProbe:
+      enabled: false
+    cronjob:
+      enabled: true
+      type: sidecar
+    volumes:
+      - name: nextcloud-data
+        persistentVolumeClaim:
+          claimName: nextcloud-pvc

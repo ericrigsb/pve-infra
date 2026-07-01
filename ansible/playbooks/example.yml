@@ -1,0 +1,4 @@
+- name: Example
+  hosts: all
+  roles:
+    - common

@@ -1,0 +1,5 @@
+proxy_nordvpn_user: "eric"
+proxy_vpn_interface: "nordlynx"
+proxy_main_interface: "eth1"
+proxy_servers_interface: "eth0"
+proxy_nordvpn_auth_token: "{{ lookup('env', 'NORDVPN_AUTH_TOKEN') }}"
