@@ -1,0 +1,6 @@
+---
+- name: Restart sendspin bridge
+  ansible.builtin.systemd:
+    name: sendspin-client
+    state: restarted
+    daemon_reload: true

@@ -1,0 +1,113 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: immich-backup
+  namespace: immich
+  labels:
+    app: immich-backup
+spec:
+  schedule: "45 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # All four backup CronJobs write to the same NFS export, so a struggling
+      # mount is a shared failure. One retry recovers a transient blip without
+      # hammering the export six more times; the next nightly run is the real
+      # recovery path if it is genuinely down.
+      backoffLimit: 1
+      # Hard-mounted NFS can hang restic forever, in which case the pod never
+      # exits and concurrencyPolicy: Forbid blocks every future run. This
+      # ceiling is ~4x the slowest run observed (33m40s, which included the ML
+      # cache removed in #496) so a legitimately long backup is never killed.
+      activeDeadlineSeconds: 7200
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: gitea-registry
+          containers:
+          - name: immich-backup
+            image: gitea.mesh.rigsb.net/eric/backup-runner:latest
+            env:
+            - name: RESTIC_CACHE_DIR
+              value: "/tmp"
+            - name: RESTIC_PASSWORD_FILE
+              value: "/etc/restic-secret/password"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              source /scripts/backup-service.sh
+              backup_service "Immich" "/backup/k8s-immich" "/usr/src/app"
+            volumeMounts:
+            - name: immich-library
+              mountPath: /usr/src/app
+              readOnly: true
+            - name: restic-secret
+              mountPath: /etc/restic-secret
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+            - name: backup-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+                # RESTIC_CACHE_DIR=/tmp sits in the container rootfs, i.e. on
+                # the node's ephemeral storage. The immich repo's index is
+                # ~28.7 MiB (2026-10-16), so 1Gi is ample; exceeding it fails
+                # this job rather than filling the node and evicting ingress.
+                ephemeral-storage: 128Mi
+              limits:
+                cpu: 300m
+                memory: 512Mi
+                ephemeral-storage: 1Gi
+          serviceAccountName: immich-backup-sa
+          volumes:
+          - name: immich-library
+            persistentVolumeClaim:
+              claimName: immich-library-pvc
+          - name: restic-secret
+            secret:
+              secretName: restic-secret
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-storage-pvc
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: immich-backup-sa
+  namespace: immich
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-secrets-reader
+  namespace: immich
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: immich-backup-secrets-binding
+  namespace: immich
+subjects:
+- kind: ServiceAccount
+  name: immich-backup-sa
+  namespace: immich
+roleRef:
+  kind: Role
+  name: backup-secrets-reader
+  apiGroup: rbac.authorization.k8s.io

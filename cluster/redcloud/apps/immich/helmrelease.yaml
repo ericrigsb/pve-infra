@@ -1,0 +1,125 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: immich
+  namespace: immich
+spec:
+  interval: 5m
+  chartRef:
+    kind: OCIRepository
+    name: immich
+    namespace: flux-system
+  values:
+    immich:
+      persistence:
+        library:
+          existingClaim: immich-library-pvc
+    server:
+      controllers:
+        main:
+          # Two replicas so losing a node is a blip rather than an outage. The
+          # anti-affinity is what makes that true: without it both replicas can
+          # land on the same node and be evicted together, which is exactly what
+          # happened to traefik (#521). The selector is the per-controller label
+          # set the chart emits (`name: server`, from bjw-s common), so it does
+          # not anti-affine against the machine-learning deployment.
+          replicas: 2
+          pod:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: server
+                        app.kubernetes.io/instance: immich
+                    topologyKey: kubernetes.io/hostname
+          containers:
+            main:
+              image:
+                tag: v3.3.5
+              env:
+                - name: DB_HOSTNAME
+                  value: postgresql.postgresql.svc.cluster.local
+                - name: DB_USERNAME
+                  value: postgres
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: immich-db-secret
+                      key: postgres-password
+                - name: DB_DATABASE_NAME
+                  value: immich
+                - name: REDIS_HOSTNAME
+                  value: redis-master.redis.svc.cluster.local
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: immich-db-secret
+                      key: redis-password
+              # MUST be nested under containers.main. The immich chart flattens
+              # the whole `server:` block onto the root values
+              # (`get .Values "server" | mergeOverwrite $ctx.Values`), so
+              # `server.resources` becomes root `resources`, which is not a valid
+              # bjw-s key and is dropped -> the pod ran BestEffort. Here it
+              # resolves to controllers.main.containers.main.resources.
+              # No CPU limit on purpose: transcoding is bursty and a CPU cap
+              # would throttle it.
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 768Mi
+                  # Ranking-only floor. Declaring no ephemeral-storage request put
+                  # this pod in the "any usage is above the request" bucket that
+                  # kubelet evicts first — the same trap traefik hit (#521). 128Mi
+                  # matches the value already used for traefik. It is NOT a limit
+                  # and reserves no disk, so it can never gate scheduling.
+                  ephemeral-storage: 128Mi
+                limits:
+                  memory: 2Gi
+      persistence:
+        externals:
+          enabled: true
+          existingClaim: ext-lib-pvc
+    machine-learning:
+      enabled: true
+      controllers:
+        main:
+          # Same reasoning as immich-server above. The ml-cache PVC is
+          # ReadWriteMany, so two pods on different nodes can share /cache.
+          replicas: 2
+          pod:
+            affinity:
+              podAntiAffinity:
+                requiredDuringSchedulingIgnoredDuringExecution:
+                  - labelSelector:
+                      matchLabels:
+                        app.kubernetes.io/name: machine-learning
+                        app.kubernetes.io/instance: immich
+                    topologyKey: kubernetes.io/hostname
+          containers:
+            main:
+              image:
+                tag: v3.3.5-cuda
+              env:
+                TRANSFORMERS_CACHE: /cache
+                HF_XET_CACHE: /cache/huggingface-xet
+                MPLCONFIGDIR: /cache/matplotlib-config
+              # Same nesting rule as immich-server above. Measured ~205Mi idle;
+              # 2Gi covers loading CLIP/face-recognition models on demand while
+              # keeping the node's limit total bounded.
+              resources:
+                requests:
+                  cpu: 250m
+                  memory: 512Mi
+                  # Ranking-only floor (see immich-server). Model loads spill to
+                  # the /cache PVC, not the node disk, so this stays small.
+                  ephemeral-storage: 128Mi
+                limits:
+                  memory: 2Gi
+      persistence:
+        cache:
+          enabled: true
+          type: persistentVolumeClaim
+          existingClaim: immich-ml-cache-pvc
+          globalMounts:
+            - path: /cache

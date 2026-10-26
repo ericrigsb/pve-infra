@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: music-assistant-pv
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - hard
+  nfs:
+    server: 10.0.4.10
+    path: /mnt/share/k8s/music-assistant-pv
+  persistentVolumeReclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: music-assistant-backup-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - hard
+  nfs:
+    server: 10.0.4.8
+    path: /mnt/backup
+  persistentVolumeReclaimPolicy: Retain

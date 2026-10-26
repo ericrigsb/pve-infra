@@ -1,0 +1,79 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: music-assistant
+  namespace: music-assistant
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: music-assistant
+      version: 0.4.13
+      sourceRef:
+        kind: HelmRepository
+        name: bdclark
+        namespace: flux-system
+  install:
+    remediation:
+      retries: 3
+  values:
+    image:
+      repository: ghcr.io/music-assistant/server
+      tag: "2.10.8"
+      pullPolicy: IfNotPresent
+    hostNetwork: true
+    dnsPolicy: ClusterFirstWithHostNet
+    nodeSelector:
+      kubernetes.io/hostname: talos-worker-04
+    env:
+      - name: TZ
+        value: UTC
+    podSecurityContext:
+      fsGroup: 1000
+    securityContext:
+      runAsUser: 0
+      runAsGroup: 0
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+          - ALL
+        add:
+          - SYS_ADMIN
+          - DAC_READ_SEARCH
+          - NET_BIND_SERVICE
+    service:
+      enabled: true
+      type: ClusterIP
+      webPort: 8095
+      streamPort: 8097
+    persistence:
+      enabled: true
+      existingClaim: music-assistant-pvc
+    additionalVolumes:
+      - name: music-library
+        nfs:
+          server: 10.0.4.10
+          path: /mnt/share/Music/Music/Media.localized/Music
+      # See bandcamp-parsers-patch-configmap.yaml: bandcamp_async_api's
+      # vendored feed parser raises KeyError on fields Bandcamp's API
+      # omits, breaking the Bandcamp Feed recommendations/browse entirely.
+      - name: bandcamp-parsers-patch
+        configMap:
+          name: music-assistant-bandcamp-parsers-patch
+    additionalMounts:
+      - name: music-library
+        mountPath: /media/music
+        readOnly: true
+      - name: bandcamp-parsers-patch
+        mountPath: /app/venv/lib/python3.14/site-packages/bandcamp_async_api/parsers.py
+        subPath: parsers.py
+        readOnly: true
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+    strategy:
+      type: Recreate

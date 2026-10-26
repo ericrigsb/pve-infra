@@ -1,0 +1,143 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: nextcloud
+  namespace: nextcloud
+spec:
+  interval: 5m
+  chart:
+    spec:
+      chart: nextcloud
+      version: 9.4.1
+      sourceRef:
+        kind: HelmRepository
+        name: nextcloud
+        namespace: flux-system
+  values:
+    image:
+      repository: nextcloud
+      flavor: apache
+      pullPolicy: Always
+    # Top-level `resources` is the key this chart reads
+    # (templates/deployment.yaml -> .Values.resources). `nextcloud.resources`
+    # is silently ignored, so the nextcloud + nextcloud-cron containers ran
+    # BestEffort with no requests at all. No CPU limit on purpose (PHP/Apache
+    # plus preview generation is bursty). Measured usage ~293Mi.
+    resources:
+      requests:
+        cpu: 300m
+        memory: 512Mi
+        # Ranking-only floor (see immich). Not a limit; reserves no disk.
+        ephemeral-storage: 128Mi
+      limits:
+        memory: 2Gi
+
+    phpClientHttpsFix:
+      enabled: true
+      protocol: https
+    # Main nextcloud app: 2 replicas + hard anti-affinity. Redis sessions must
+    # be shared (now enabled via externalRedis) to avoid logouts with multiple
+    # pods. The chart reads top-level replicaCount/affinity.
+    replicaCount: 2
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: nextcloud
+                app.kubernetes.io/instance: nextcloud
+                app.kubernetes.io/component: app
+            topologyKey: kubernetes.io/hostname
+
+    nextcloud:
+      host: nextcloud.mesh.rigsb.net
+      configs:
+        override.config.php: |
+          <?php
+          $CONFIG = array (
+            'overwrite.cli.url' => 'https://nextcloud.mesh.rigsb.net',
+            'overwriteprotocol' => 'https',
+            'trusted_proxies' => ['10.0.0.0/8'],
+            'maintenance_window_start' => 6,
+            'maintenance' => false,
+          );
+    internalDatabase:
+      enabled: false
+    externalDatabase:
+      enabled: true
+      type: postgresql
+      host: postgresql.postgresql.svc.cluster.local
+      database: nextcloud
+    redis:
+      enabled: false
+    externalRedis:
+      enabled: true
+      host: redis-master.redis.svc.cluster.local
+      port: "6379"
+      # `nextcloud-db` already carries `redis-password` with the same
+      # REDIS_PASSWORD value the `redis-auth` secret holds in the redis ns
+      # (verified identical), so no extra secret or workflow step is needed.
+      existingSecret:
+        enabled: true
+        secretName: nextcloud-db
+        passwordKey: redis-password
+    persistence:
+      enabled: true
+      existingClaim: nextcloud-pvc
+    imaginary:
+      enabled: true
+      # Two replicas, forced onto different nodes. Note that the imaginary
+      # deployment template (templates/imaginary/deployment.yaml) renders
+      # nodeSelector, tolerations and topologySpreadConstraints but *not*
+      # `affinity` — an `imaginary.affinity` key would be silently dropped,
+      # which is the #14 trap. A DoNotSchedule spread is the exact equivalent
+      # of required podAntiAffinity for a two-replica deployment.
+      replicaCount: 2
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: nextcloud
+              app.kubernetes.io/instance: nextcloud
+              app.kubernetes.io/component: imaginary
+      # `imaginary.resources` IS the correct key for this subchart (confirmed
+      # applied live), so this is pure right-sizing: measured usage is ~7Mi
+      # against a 320Mi request. The 640Mi limit stays as headroom for large
+      # image conversions.
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+          # Ranking-only floor (see immich-server). Not a limit; reserves no disk.
+          ephemeral-storage: 128Mi
+        limits:
+          cpu: 500m
+          memory: 640Mi
+    startupProbe:
+      enabled: false
+    livenessProbe:
+      enabled: false
+    cronjob:
+      enabled: true
+      type: sidecar
+      # The crond sidecar does NOT inherit the top-level `resources` (the chart
+      # only applies those to the main nextcloud container), so it was landing
+      # BestEffort too. `cronjob.sidecar.resources` is read at
+      # templates/deployment.yaml:244. cron.php runs the real background work
+      # (previews, scanning, trash), so it needs its own headroom.
+      sidecar:
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+            # Ranking-only floor (see immich-server). cron.php writes previews to
+            # the data PVC, not the node disk, so this stays small.
+            ephemeral-storage: 128Mi
+          limits:
+            memory: 1Gi
+    volumes:
+      - name: nextcloud-data
+        persistentVolumeClaim:
+          claimName: nextcloud-pvc

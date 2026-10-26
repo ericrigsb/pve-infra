@@ -1,0 +1,91 @@
+- name: Force apt to use IPv4
+  # No guest on this mesh has a routable IPv6 (link-local only, no default v6
+  # route), but the Ubuntu mirrors' DNS returns AAAA records, and apt/getaddrinfo
+  # prefers them. That wedged apt-daily.service on `docker` for 2 days (holding
+  # /var/lib/apt/lists/lock the whole time, which then broke every Ansible run
+  # that touched apt until someone killed it by hand) - a dead end that no
+  # retry/lock_timeout could have waited out. Forcing IPv4 removes the hang at
+  # its source for every apt invocation, not just the ones Ansible runs.
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/99-force-ipv4
+    content: |
+      Acquire::ForceIPv4 "true";
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+    # Defense-in-depth, not the fix for the above: apt-daily.timer/
+    # apt-daily-upgrade.timer stay enabled (they're the only thing patching
+    # guests between infra PRs - provision.yml has no schedule trigger), so a
+    # short, legitimate overlap with an Ansible run is still possible. Wait
+    # rather than fail immediately on it.
+    lock_timeout: 60
+  notify: Upgrade all packages
+
+- name: Ensure sudo is installed
+  ansible.builtin.apt:
+    name: sudo
+    state: present
+    lock_timeout: 60
+
+- name: Ensure the user exists
+  ansible.builtin.user:
+    name: "{{ common_username }}"
+    password: "{{ common_password | password_hash('sha512') }}"
+    shell: /bin/bash
+    groups: sudo
+    append: true
+    state: present
+    create_home: true
+
+- name: Set authorized key for user
+  ansible.posix.authorized_key:
+    user: "{{ common_username }}"
+    state: present
+    key: "{{ common_ssh_pub_key }}"
+    path: "/home/{{ common_username }}/.ssh/authorized_keys"
+
+- name: Disable password authentication in SSH
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication'
+    line: 'PasswordAuthentication no'
+    state: present
+    backup: true
+
+- name: Restart SSH
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+    enabled: true
+
+- name: Register host IPv4 address in Technitium DNS
+  ansible.builtin.uri:
+    url: "{{ common_technitium_url }}/api/zones/records/add"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ common_technitium_api_token }}"
+    body_format: form-urlencoded
+    body:
+      domain: "{{ ansible_facts['hostname'] }}.{{ common_technitium_zone }}"
+      zone: "{{ common_technitium_zone }}"
+      type: A
+      ttl: 3600
+      ipAddress: "{{ inventory_hostname }}"
+      overwrite: "true"
+    status_code: 200
+  when:
+    - common_technitium_url | length > 0
+    - common_technitium_api_token | length > 0
+  register: common_technitium_record_result
+
+- name: Fail if Technitium DNS record update was unsuccessful
+  ansible.builtin.fail:
+    msg: "Technitium API error: {{ common_technitium_record_result.json.errorMessage | default('unknown error') }}"
+  when:
+    - common_technitium_record_result is not skipped
+    - common_technitium_record_result.json.status | default('') != 'ok'

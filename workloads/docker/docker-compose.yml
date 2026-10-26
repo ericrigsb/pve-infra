@@ -1,0 +1,96 @@
+services:
+# home network services
+# gitea-runner
+  gitea-runner:
+    image: docker.io/gitea/act_runner:latest
+    container_name: gitea-runner
+    networks:
+      - main
+    env_file:
+      - .env
+    volumes:
+      - ./gitea-runner/config.yaml:/config.yaml
+      - ./gitea-runner/data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+# garage  
+  garage:
+    image: dxflrs/garage:v2.2.0
+    container_name: garage
+    networks:
+      - main
+    ports:
+      - 3900:3900
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./garage/config.toml:/etc/garage.toml:ro
+      - ./garage/meta:/var/lib/garage/meta
+      - ./garage/data:/var/lib/garage/data
+# uptime-kuma
+  uptime-kuma:
+    image: louislam/uptime-kuma:2
+    container_name: uptime-kuma
+    volumes:
+      - ./uptime-kuma/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - main
+    ports:
+      - 3001:3001
+    restart: unless-stopped
+# lidarr
+  lidarr:
+    image: lscr.io/linuxserver/lidarr:latest
+    container_name: lidarr
+    env_file: .env
+    networks:
+      - main
+    ports:
+      - 8686:8686
+    volumes:
+        - ./lidarr/config:/config
+        - /mnt/share/Music/Music/Media.localized/Music:/music
+        - ./shared-downloads:/downloads/complete
+    restart: unless-stopped
+# DISABLED: slskd. Not deployed on purpose -- enabled only if Soulseek is
+# actually wanted. Uncomment to re-enable. Note that `docker compose up -d
+# --remove-orphans` will create this container as soon as it is uncommented,
+# because the compose file is the declaration of what runs; it will not stay
+# inert. Requires SLSKD_* in .env (see roles/docker/defaults/main.yml).
+#  slskd:
+#    image: slskd/slskd:latest
+#    container_name: slskd
+#    env_file: .env
+#    networks:
+#      - main
+#    ports:
+#      - 5030:5030
+#      - 5031:5031
+#      - 50300:50300
+#    restart: unless-stopped
+#    volumes:
+#      - ./slskd/config:/app
+#      - ./shared-downloads:/downloads
+#      - /mnt/share/Music/Music/Media.localized/Music:/music
+
+# DISABLED: soularr. Its only job is bridging lidarr's wanted list into slskd
+# searches and downloads, so it is inert while slskd is off. Uncomment both
+# together, not separately.
+#  soularr:
+#    image: mrusse08/soularr:latest
+#    container_name: soularr
+#    user: "1000:1000"
+#    env_file: .env
+#    networks:
+#      - main
+#    ports:
+#      - 8265:8265
+#    restart: unless-stopped
+#    volumes:
+#      - ./shared-downloads:/downloads
+#      - ./soularr/data:/data
+networks:
+  main:
+    driver: bridge

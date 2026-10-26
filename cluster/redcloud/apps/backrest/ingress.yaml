@@ -1,0 +1,21 @@
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: backrest
+  namespace: backrest
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    external-dns.alpha.kubernetes.io/target: traefik.mesh.rigsb.net
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`backrest.mesh.rigsb.net`)
+      kind: Rule
+      services:
+        - name: backrest
+          port: 9898
+      middlewares:
+        - name: security-headers
+          namespace: traefik

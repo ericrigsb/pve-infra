@@ -1,0 +1,4 @@
+- name: Dns01
+  hosts: all
+  roles:
+    - community_script

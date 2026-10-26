@@ -1,0 +1,36 @@
+---
+# Handlers for the Docker workload host.
+#
+# Every handler here is deliberately conservative about changing what is
+# running: the compose services are mostly pinned to floating tags, so an
+# action that pulls or recreates a container is an upgrade, not a reconcile.
+#
+# The compose reconcile is NOT a handler. It runs unconditionally as a task,
+# because a handler fires only when a task reported changed -- so a run in
+# which every file was already correct would reconcile nothing, and a .env
+# written on one run would sit unapplied until some later run happened to
+# rewrite a file. See the task in tasks/main.yml.
+
+- name: Restart Garage
+  ansible.builtin.command:
+    cmd: docker restart garage
+  changed_when: true
+  # Garage caches its config at startup, so replacing garage.toml needs a
+  # restart to take effect. Scoped to the one container rather than a full
+  # `compose up` so a config change cannot cascade into unrelated services.
+  # `command`, not `community.docker.docker_container`: CI installs no
+  # collections (ansible/.ansible/collections is empty), so anything outside
+  # ansible.builtin would fail there.
+
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart the restic backup service
+  ansible.builtin.systemd:
+    name: backup.service
+    state: restarted
+  failed_when: false
+  # Only runs if the service is currently active. A restart is needed for a
+  # changed backup.sh to be picked up, but the timer may legitimately not have
+  # fired yet on a freshly adopted host.

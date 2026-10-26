@@ -1,0 +1,39 @@
+# Writable state for Backrest: /config/config.json (rewritten atomically on
+# every change, with 10 timestamped .bak files alongside it) and the oplog
+# sqlite database under /data. Both must be persistent and writable, so this
+# is a separate volume from the read-only repo mount above.
+#
+# The NFS export backing this path must exist on 10.0.4.10:
+#   /mnt/share/k8s/backrest-pv
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: backrest-state-pv
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - hard
+  nfs:
+    server: 10.0.4.10
+    path: /mnt/share/k8s/backrest-pv
+  persistentVolumeReclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backrest-state-pvc
+  namespace: backrest
+  labels:
+    app.kubernetes.io/name: backrest
+    app.kubernetes.io/component: backup-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 1Gi
+  volumeName: backrest-state-pv

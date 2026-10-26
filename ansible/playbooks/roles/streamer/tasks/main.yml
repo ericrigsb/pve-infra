@@ -1,0 +1,93 @@
+- name: Install streamer packages
+  ansible.builtin.apt:
+    name:
+      - alsa-utils
+    state: present
+    update_cache: true
+
+- name: Ensure bin directory exists
+  ansible.builtin.file:
+    path: "{{ streamer_bin_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Install uv
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      python3 -c 'import urllib.request,sys; urllib.request.urlretrieve(sys.argv[1], sys.argv[2])' \
+        'https://github.com/astral-sh/uv/releases/latest/download/uv-{{ streamer_arch }}-unknown-linux-gnu.tar.gz' \
+        '{{ streamer_bin_dir }}/uv.tar.gz'
+      tar -C /usr/local/bin --strip-components=1 -xzf '{{ streamer_bin_dir }}/uv.tar.gz' \
+        'uv-{{ streamer_arch }}-unknown-linux-gnu/uv'
+      rm -f '{{ streamer_bin_dir }}/uv.tar.gz'
+  args:
+    creates: "{{ streamer_uv_bin }}"
+
+- name: Ensure sendspin state directory exists
+  ansible.builtin.file:
+    path: "{{ streamer_sendspin_state_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Create sendspin virtualenv
+  ansible.builtin.command:
+    cmd: "{{ streamer_uv_bin }} venv --python {{ streamer_sendspin_python }} {{ streamer_venv_dir }}"
+  args:
+    creates: "{{ streamer_venv_dir }}/pyvenv.cfg"
+
+- name: Check sendspin virtualenv packages
+  ansible.builtin.command:
+    cmd: "{{ streamer_venv_dir }}/bin/python -c 'import aiosendspin, av'"
+  register: streamer_sendspin_pkg_check
+  failed_when: false
+  changed_when: false
+
+- name: Install sendspin virtualenv packages
+  ansible.builtin.command:
+    cmd: >-
+      {{ streamer_uv_bin }} pip install --python {{ streamer_venv_dir }}/bin/python
+      aiosendspin=={{ streamer_sendspin_aiosendspin_version }}
+      av=={{ streamer_sendspin_av_version }}
+  when: streamer_sendspin_pkg_check.rc != 0
+  changed_when: false
+
+- name: Template fingerprint daemon legacy cleanup
+  ansible.builtin.file:
+    path: "{{ streamer_bin_dir }}/audio_id.py"
+    state: absent
+
+- name: Remove legacy streamer systemd units
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/streamer-audio-capture.service
+    - /etc/systemd/system/streamer-audio-id.service
+  notify:
+    - Reload systemd
+    - Restart streamer-sendspin-source
+
+- name: Template Sendspin source client
+  ansible.builtin.template:
+    src: "sendspin_source_client.py.j2"
+    dest: "{{ streamer_bin_dir }}/sendspin_source_client.py"
+    mode: "0755"
+  notify:
+    - Restart streamer-sendspin-source
+
+- name: Template streamer systemd units
+  ansible.builtin.template:
+    src: "streamer-sendspin-source.service.j2"
+    dest: "/etc/systemd/system/streamer-sendspin-source.service"
+    mode: "0600"
+  notify:
+    - Reload systemd
+    - Restart streamer-sendspin-source
+
+- name: Enable and start streamer services
+  ansible.builtin.systemd:
+    name: streamer-sendspin-source
+    enabled: true
+    state: started
+    daemon_reload: true

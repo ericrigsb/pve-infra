@@ -1,0 +1,106 @@
+# NOTE: do not use `is file` here. Ansible's file test stats the *controller's*
+# filesystem, not the target host, so `(btbridge_app_dir + "/sendspin-client")
+# is file` always evaluated False from the CI runner and never tested the
+# container at all. Use stat (which runs on the target) and assert on the result.
+- name: Stat the sendspin bridge application
+  ansible.builtin.stat:
+    path: "{{ btbridge_app_dir }}/sendspin-client"
+  register: btbridge_app_stat
+
+- name: Assert the sendspin bridge application is installed
+  ansible.builtin.assert:
+    that:
+      - btbridge_app_stat.stat.exists
+      - btbridge_app_stat.stat.isreg | default(false)
+    fail_msg: >-
+      {{ btbridge_app_dir }}/sendspin-client is missing or not a regular file.
+      The bridge application is installed out-of-band by the upstream
+      deployment/lxc/install.sh, not by Ansible, so Terraform managing CT 108
+      does not install it. On the Proxmox host, re-install it into CT 108; this
+      preserves /config/config.json and the stored Music Assistant token:
+      pct exec 108 -- bash -c 'curl -fsSL
+      https://raw.githubusercontent.com/trudenboy/sendspin-bt-bridge/main/deployment/lxc/install.sh
+      | bash -s -- --branch {{ btbridge_app_version }}'
+    success_msg: sendspin bridge application present
+
+- name: Assert the host D-Bus bridge is mounted
+  ansible.builtin.stat:
+    path: "{{ btbridge_dbus_socket }}"
+  register: btbridge_dbus_socket_stat
+
+- name: Assert the host D-Bus socket is reachable
+  ansible.builtin.assert:
+    that:
+      - btbridge_dbus_socket_stat.stat.exists
+    fail_msg: >-
+      {{ btbridge_dbus_socket }} is missing. The host's bluetoothd is exposed to
+      the container by bind-mounting /run/dbus, which requires this line in
+      /etc/pve/lxc/108.conf on pve2 followed by a container restart:
+      lxc.mount.entry: /run/dbus bt-dbus none bind,create=dir 0 0
+    success_msg: host D-Bus socket present
+
+- name: Ensure config directory exists
+  ansible.builtin.file:
+    path: "{{ btbridge_config_dir }}"
+    state: directory
+    mode: "0755"
+
+# config.json is intentionally never templated. The bridge writes runtime state
+# into it (SECRET_KEY, MA_ACCESS_TOKEN, MA_REFRESH_TOKEN, LAST_VOLUMES,
+# LAST_SINKS, CONFIG_SCHEMA_VERSION, ...), so a managed copy would destroy the
+# stored Music Assistant token on every run. The web UI is the supported surface
+# for it; only seed the file when it does not exist yet.
+#
+# The guard must be stat-based, not `not (btbridge_config_file is file)`: the
+# file test runs on the controller, where /config/config.json never exists, so
+# that condition was always True and this task would have clobbered the real
+# config (and the stored token) on every run.
+- name: Stat the bridge config
+  ansible.builtin.stat:
+    path: "{{ btbridge_config_file }}"
+  register: btbridge_config_stat
+
+- name: Seed default bridge config
+  ansible.builtin.copy:
+    dest: "{{ btbridge_config_file }}"
+    mode: "0600"
+    content: |
+      {
+        "SENDSPIN_SERVER": "auto",
+        "SENDSPIN_PORT": 8927,
+        "WEB_PORT": {{ btbridge_web_port }},
+        "BASE_LISTEN_PORT": {{ btbridge_base_listen_port }},
+        "BLUETOOTH_DEVICES": [],
+        "TZ": "UTC"
+      }
+  when: not btbridge_config_stat.stat.exists
+
+- name: Pin bridge listener ports in the environment
+  ansible.builtin.lineinfile:
+    path: /etc/environment
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    state: present
+    mode: "0644"
+  loop:
+    - key: WEB_PORT
+      value: "{{ btbridge_web_port }}"
+    - key: BASE_LISTEN_PORT
+      value: "{{ btbridge_base_listen_port }}"
+  notify: Restart sendspin bridge
+
+- name: Keep the local bluetooth stack masked
+  ansible.builtin.systemd:
+    name: bluetooth
+    masked: true
+    enabled: false
+    state: stopped
+  failed_when: false
+
+- name: Enable and start bridge services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  loop: "{{ btbridge_services }}"

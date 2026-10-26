@@ -1,0 +1,7 @@
+common_username: "{{ lookup('env', 'GUEST_USER') }}"  # noqa: var-naming[no-role-prefix]
+common_password: "{{ lookup('env', 'GUEST_USER_PASSWORD') }}"  # noqa: var-naming[no-role-prefix]
+common_ssh_pub_key: "{{ lookup('env', 'GUEST_USER_PUBLIC_KEY') }}"  # noqa: var-naming[no-role-prefix]
+
+common_technitium_url: "{{ lookup('env', 'TECHNITIUM_URL') }}"  # noqa: var-naming[no-role-prefix]
+common_technitium_api_token: "{{ lookup('env', 'TECHNITIUM_API_TOKEN') }}"  # noqa: var-naming[no-role-prefix]
+common_technitium_zone: "{{ lookup('env', 'TECHNITIUM_ZONE') | default('lan', true) }}"  # noqa: var-naming[no-role-prefix]

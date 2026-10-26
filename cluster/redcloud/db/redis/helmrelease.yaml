@@ -1,0 +1,47 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: redis
+  namespace: redis
+spec:
+  interval: 10m
+  chart:
+    spec:
+      chart: redis
+      version: "24.1.3"
+      sourceRef:
+        kind: HelmRepository
+        name: bitnami-oci
+        namespace: flux-system
+  values:
+    architecture: standalone
+    replicaCount: 1
+    # Bitnami no longer publishes versioned tags for free images (only
+    # `latest` + anonymous sha256 digests). `latest` is a rolling tag that
+    # can momentarily point at a pre-release build with an incompatible,
+    # newer RDB format, then roll back to a stable release that can't read
+    # its own data (#redis-rdb-v15-incident). Pin by digest so every node
+    # resolves to the exact same image regardless of when it pulls.
+    # Current digest is Redis 8.10.3 (bitnami/redis, confirmed can read
+    # RDB format 14). Re-verify before bumping.
+    image:
+      digest: sha256:37c559e3894161f1b1122353a54938e30299383ae801417debda7d3e7d69490a
+    commonConfiguration: |-
+      appendonly yes
+      save ""
+    auth:
+      existingSecret: redis-auth
+    master:
+      persistence:
+        enabled: true
+        existingClaim: redis-static-pvc
+      # `master.resources` is the correct key for the bitnami redis chart
+      # (confirmed applied live), so this is pure right-sizing: measured usage
+      # is ~20Mi / 23m against a 768Mi / 400m request and a 1.536Gi limit.
+      resources:
+        requests:
+          cpu: 100m
+          memory: 128Mi
+        limits:
+          cpu: 800m
+          memory: 512Mi

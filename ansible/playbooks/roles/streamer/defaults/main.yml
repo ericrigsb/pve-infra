@@ -1,0 +1,18 @@
+# Cubilux HLMS-C4 USB sound card, Line In jack (card 1 device 1). plughw (not
+# hw) so a mono/exotic capture format is converted rather than failing.
+streamer_soundcard: "plughw:CARD=HLMSC4,DEV=1"
+streamer_bin_dir: /opt/streamer/bin
+streamer_sendspin_server: 10.0.4.14
+streamer_sendspin_port: 8927
+streamer_sendspin_client_name: "Streamer Analog In"
+streamer_sendspin_state_dir: /var/lib/streamer/sendspin
+streamer_sendspin_python: "3.12"
+streamer_sendspin_aiosendspin_version: "10.2.1"
+streamer_sendspin_av_version: "16.1.0"
+streamer_sendspin_signal_enabled: true
+streamer_sendspin_signal_threshold: 0.02
+streamer_sendspin_signal_probe_ms: 150
+streamer_sendspin_signal_debounce_ms: 300
+streamer_venv_dir: "{{ streamer_bin_dir }}/venv"
+streamer_uv_bin: /usr/local/bin/uv
+streamer_arch: x86_64

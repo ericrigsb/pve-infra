@@ -1,0 +1,4 @@
+- name: Dns02
+  hosts: all
+  roles:
+    - community_script

@@ -1,0 +1,122 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: music-assistant-backup
+  namespace: music-assistant
+  labels:
+    app: music-assistant-backup
+spec:
+  schedule: "15 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # This job lost three consecutive nights (09-27..09-29) to NFS contention
+      # when it shared 06:30 with the nextcloud backup; the schedule was
+      # staggered to 06:15 in #496. One retry covers a residual blip without
+      # piling more load onto the shared export.
+      backoffLimit: 1
+      # Unstick a hard-mounted NFS hang, which would otherwise leave the pod
+      # running forever and block all future runs via concurrencyPolicy: Forbid.
+      # ~17x the slowest observed run (0m52s).
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: gitea-registry
+          containers:
+          - name: music-assistant-backup
+            image: gitea.mesh.rigsb.net/eric/backup-runner:latest
+            env:
+            - name: RESTIC_CACHE_DIR
+              value: "/tmp"
+            - name: RESTIC_PASSWORD_FILE
+              value: "/etc/restic-secret/password"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              source /scripts/backup-service.sh
+              backup_service "Music Assistant" "/backup/k8s-music-assistant" "/data"
+            volumeMounts:
+            - name: data
+              mountPath: /data
+              readOnly: true
+            - name: restic-secret
+              mountPath: /etc/restic-secret
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+            - name: backup-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+                # RESTIC_CACHE_DIR=/tmp sits in the container rootfs, i.e. on
+                # the node's ephemeral storage (repo index is ~592 KiB). The
+                # limit exists so a runaway local write costs this job, not the
+                # node -- kubelet would otherwise evict ingress first.
+                ephemeral-storage: 128Mi
+              limits:
+                cpu: 300m
+                memory: 512Mi
+                ephemeral-storage: 1Gi
+            # The Music Assistant app runs as root (runAsUser: 0 in the
+            # HelmRelease) and writes cover art and cache files with mode 600.
+            # The backup-runner image defaults to USER backup (uid 1001), which
+            # cannot read 600 root:root files -- group membership in root grants
+            # nothing because the group bits are ---. restic then fails with
+            # EACCES on ~2500 files and the job dies on BackoffLimitExceeded.
+            # Read as root so the reader matches the writer.
+            securityContext:
+              runAsUser: 0
+              runAsGroup: 0
+          serviceAccountName: music-assistant-backup-sa
+          volumes:
+          - name: data
+            persistentVolumeClaim:
+              claimName: music-assistant-pvc
+          - name: restic-secret
+            secret:
+              secretName: restic-secret
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-storage-pvc
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: music-assistant-backup-sa
+  namespace: music-assistant
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-secrets-reader
+  namespace: music-assistant
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: music-assistant-backup-secrets-binding
+  namespace: music-assistant
+subjects:
+- kind: ServiceAccount
+  name: music-assistant-backup-sa
+  namespace: music-assistant
+roleRef:
+  kind: Role
+  name: backup-secrets-reader
+  apiGroup: rbac.authorization.k8s.io
