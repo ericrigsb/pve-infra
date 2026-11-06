@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mailrise-config
+  namespace: mailrise
+data:
+  mailrise.conf: |
+    configs:
+      slack:
+        urls:
+          - !env_var SLACK_API_URL
+      eric@rigsb.net:
+        urls:
+          - !env_var SLACK_API_URL

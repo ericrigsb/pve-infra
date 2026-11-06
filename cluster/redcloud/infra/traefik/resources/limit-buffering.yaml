@@ -1,0 +1,39 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: limit-buffering
+  namespace: traefik
+spec:
+  buffering:
+    # Was 10000000000 (10 GB), which is not a limit in any meaningful sense.
+    #
+    # Traefik's buffering middleware (vulcand/oxy -> mailgun/multibuf) writes
+    # BOTH request and response bodies that exceed the ~2 MiB mem*Bytes default
+    # to a `temp-multibuf-*` file in the pod's /tmp emptyDir. That is NODE DISK,
+    # and the whole body is read into that file before a single byte reaches the
+    # client, so every download over ~2 MiB on the 15 routes using this
+    # middleware touches nodefs.
+    #
+    # On 2026-10-16 traefik's two pods held ~8.5 GB of such orphans — 3.46 GB on
+    # cp-02 and 2.49 GB + 2.56 GB on worker-01 — left behind when transfers
+    # aborted, never cleaned up (upstream traefik/traefik#9218). cp-01's whole
+    # nodefs is only 7.8 GiB with 4.1 GiB already used, and the eviction
+    # threshold is nodefs.available < 10% (0.78 GiB), so a spill that big pushes
+    # the node into DiskPressure and kubelet evicts the pod with the highest
+    # usage-above-request. That pod is traefik, which is how the estate lost its
+    # ingress for 13s (#521).
+    #
+    # 2 GiB bounds a single upload spill so it still lands safely on cp-01
+    # (4.1 + 2 = 6.1 of 7.8 GiB, 22% free, above the 10% threshold) while
+    # staying far above any real upload on these routes: nextcloud chunks at
+    # ~10 MiB, garage uses S3 multipart, openspeedtest posts ~100 MiB.
+    # Exceeding it returns 413.
+    #
+    # maxResponseBodyBytes is deliberately left unset: capping it would 413
+    # large garage/nextcloud downloads. The `tmp-sweep` sidecar in
+    # base/traefik-values.yaml is what bounds response spills instead — it reaps
+    # stale `temp-multibuf-*` files from the pod's /tmp emptyDir every 5 minutes.
+    # Note also that this middleware has no retryExpression (it was added in
+    # fed3589 then reverted five minutes later in 2e15dea), so the buffering
+    # buys no retry — only the 413 guard and the chunked-encoding normalisation.
+    maxRequestBodyBytes: 2147483648   # 2 GiB

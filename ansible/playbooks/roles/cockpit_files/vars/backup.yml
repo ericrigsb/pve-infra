@@ -1,0 +1,57 @@
+# Per-host file-server settings for the `backup` LXC (10.0.4.8).
+# Consumed by the `cockpit_files` role. See the role README.
+
+# --- Data mount ---
+# NTFS, mounted with ntfs-3g on the Proxmox host pve2 and PROPAGATED into this
+# container -- not mounted by the container, and not Ansible-manageable.
+# Verified from inside: /dev has no block devices at all, mountinfo shows
+# shared:498 master:45 against a shared:497 root, systemd synthesises
+# mnt-backup.mount with no backing file, and there is no /lib/modules,
+# /dev/fuse or ntfs-3g binary in-container. There is no mp0 entry and no
+# fstab line. Asserted only.
+cockpit_files_data_mountpoints:
+  - /mnt/backup
+
+# --- Exports ---
+# RECORDED HERE, NOT DEPLOYED. The Cockpit file-sharing UI owns
+# /etc/exports.d/cockpit-file-sharing.exports and this role writes no exports
+# file of its own. What follows is the assertion the role checks the live UI
+# file against, so if you change an export in the UI, change it here too or CI
+# will fail. The `comment` keys are documentation only -- nothing renders them.
+#
+# This single export backs EVERY restic repository in the cluster: immich,
+# nextcloud, music-assistant, unifi and backrest each have a PersistentVolume
+# pointing at this server+path with NO subPath, so all five pods mount the
+# same directory and contend for one export. Losing this export fails all
+# backups at once. See AGENTS.md #1.
+#
+# Options are copied from the live UI-generated export verbatim. No -fsid is
+# set here: nothing in git references fsid (all 15 NFS PVs mount by
+# server+path), so a rebuilt guest generating a fresh UUID is invisible to the
+# cluster -- and the assertion ignores -fsid for the same reason.
+cockpit_files_exports:
+  - path: /mnt/backup
+    comment: "restic repositories for immich, nextcloud, music-assistant, unifi, backrest"
+    clients:
+      - 10.0.4.0/24
+    options:
+      - rw
+      - async
+      - no_subtree_check
+
+# --- Add-on versions ---
+# These MUST match what this host runs live. Do not copy them to another host
+# without checking that host's installed version first -- see the role README.
+cockpit_files_addon_debs:
+  - name: cockpit-file-sharing
+    file: cockpit-file-sharing_4.2.10-3focal_all.deb
+    version: 4.2.10-3focal
+    sha256: 486c28d6df78552d5e99a1ffc07ee15fdf6cb829cf249ed01954af10d6a0cd96
+  - name: cockpit-identities
+    file: cockpit-identities_0.1.12-1focal_all.deb
+    version: 0.1.12-1focal
+    sha256: 85d1412da210c86d0ebad35624fc512d895fd52f09ee0a8629cc1bc3bd0e825a
+  - name: cockpit-navigator
+    file: cockpit-navigator_0.5.10-1focal_all.deb
+    version: 0.5.10-1focal
+    sha256: 784b8b1d7e02224594d34e6d60945c72b54a557692a37fefbb0046146b74040e

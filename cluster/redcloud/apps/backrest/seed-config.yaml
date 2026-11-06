@@ -1,0 +1,89 @@
+# Seed configuration for Backrest.
+#
+# The init container copies this into /config/config.json on first start ONLY if
+# the file is not already present, so any changes made later through the UI
+# survive pod restarts. The single __BACKREST_ADMIN_BCRYPT__ placeholder is
+# substituted at seed time from the backrest-admin secret.
+#
+# Notes that matter, all verified against the v1.14.1 source:
+#
+#   * "version" must be 6. A config with version 0 and any content is a hard
+#     startup error (internal/config/migrations/migrations.go:27).
+#   * "guid" is the repo id from `restic cat config --json`, and it is
+#     mutually exclusive with autoInitialize (validate.go:89-98). With guid set,
+#     autoInitialize must be false.
+#   * "password" is intentionally absent. Backrest passes its whole process
+#     environment to restic (repo.go:42, WithEnviron), so the repos pick up
+#     RESTIC_PASSWORD from the Deployment's secretKeyRef and the plaintext
+#     password never lands in this file. Leaving "password" empty also makes
+#     migration005 a no-op, since it only inspects repos that have one.
+#   * "--no-lock" is mandatory, not a nicety: on the read-only mount restic
+#     otherwise spins on lock-file writes for 70+ seconds and then fails.
+#   * No prunePolicy / checkPolicy / plans, so Backrest never mutates a
+#     repository. The existing Flux CronJobs remain the only writers.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backrest-seed-config
+  namespace: backrest
+  labels:
+    app.kubernetes.io/name: backrest
+    app.kubernetes.io/component: backup-system
+data:
+  config.json.template: |
+    {
+      "version": 6,
+      "instance": "redcloud",
+      "repos": [
+        {
+          "id": "k8s-immich",
+          "guid": "9179ab1135beb7d0877b36887d487efddee4fd9ec2144f76ff09294d1885b1ec",
+          "uri": "/backup/k8s-immich",
+          "flags": ["--no-lock"],
+          "autoInitialize": false,
+          "autoUnlock": false
+        },
+        {
+          "id": "k8s-music-assistant",
+          "guid": "ea45c2ce0691cec74e89632159ff468fb0bc17685b37747af250d36cd29d471b",
+          "uri": "/backup/k8s-music-assistant",
+          "flags": ["--no-lock"],
+          "autoInitialize": false,
+          "autoUnlock": false
+        },
+        {
+          "id": "k8s-nextcloud",
+          "guid": "82e6e86ee14a9e4100891db5d47c2ebcb831b44baece3dd152830d630bc97729",
+          "uri": "/backup/k8s-nextcloud",
+          "flags": ["--no-lock"],
+          "autoInitialize": false,
+          "autoUnlock": false
+        },
+        {
+          "id": "k8s-unifi",
+          "guid": "d755cd7a17661019d8badd2807653c2d8bbaa2df5ced7bb57494cf50148c7f69",
+          "uri": "/backup/k8s-unifi",
+          "flags": ["--no-lock"],
+          "autoInitialize": false,
+          "autoUnlock": false
+        },
+        {
+          "id": "mini",
+          "guid": "176de21325b8b5b051643d79db4f11ad52162310669130944fa236006ee80d25",
+          "uri": "/backup/mini",
+          "flags": ["--no-lock"],
+          "autoInitialize": false,
+          "autoUnlock": false
+        }
+      ],
+      "plans": [],
+      "auth": {
+        "disabled": false,
+        "users": [
+          {
+            "name": "admin",
+            "passwordBcrypt": "__BACKREST_ADMIN_BCRYPT__"
+          }
+        ]
+      }
+    }

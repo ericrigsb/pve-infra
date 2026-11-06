@@ -1,0 +1,111 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: unifi-backup
+  namespace: unifi-network-application
+  labels:
+    app: unifi-backup
+spec:
+  schedule: "0 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # All four backup CronJobs write to the same NFS export, so a struggling
+      # mount is a shared failure. One retry recovers a transient blip without
+      # hammering the export six more times.
+      backoffLimit: 1
+      # Unstick a hard-mounted NFS hang, which would otherwise leave the pod
+      # running forever and block all future runs via concurrencyPolicy: Forbid.
+      # ~20x the slowest observed run (0m30s).
+      activeDeadlineSeconds: 600
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: gitea-registry
+          containers:
+          - name: unifi-backup
+            image: gitea.mesh.rigsb.net/eric/backup-runner:latest
+            env:
+            - name: RESTIC_CACHE_DIR
+              value: "/tmp"
+            - name: RESTIC_PASSWORD_FILE
+              value: "/etc/restic-secret/password"
+            command:
+            - /bin/bash
+            - -c
+            - |
+              source /scripts/backup-service.sh
+              backup_service "UniFi" "/backup/k8s-unifi" "/data/data/backup"
+            volumeMounts:
+            - name: unifi-data
+              mountPath: /data
+              readOnly: true
+            - name: restic-secret
+              mountPath: /etc/restic-secret
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+            - name: backup-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: 50m
+                memory: 128Mi
+                # RESTIC_CACHE_DIR=/tmp sits in the container rootfs, i.e. on
+                # the node's ephemeral storage (repo index is ~20 KiB). Bounds
+                # this job's local writes so they can never be what trips the
+                # node's 15% free-space eviction threshold.
+                ephemeral-storage: 32Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+                ephemeral-storage: 512Mi
+          serviceAccountName: unifi-backup-sa
+          volumes:
+          - name: unifi-data
+            persistentVolumeClaim:
+              claimName: unifi-config-pvc
+          - name: restic-secret
+            secret:
+              secretName: restic-secret
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-storage-pvc
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: unifi-backup-sa
+  namespace: unifi-network-application
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-secrets-reader
+  namespace: unifi-network-application
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: unifi-backup-secrets-binding
+  namespace: unifi-network-application
+subjects:
+- kind: ServiceAccount
+  name: unifi-backup-sa
+  namespace: unifi-network-application
+roleRef:
+  kind: Role
+  name: backup-secrets-reader
+  apiGroup: rbac.authorization.k8s.io

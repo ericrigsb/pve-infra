@@ -1,0 +1,5 @@
+- name: BT Bridge
+  hosts: all
+  roles:
+    - community_script
+    - btbridge

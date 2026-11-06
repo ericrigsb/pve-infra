@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: backrest
+  labels:
+    name: backrest
+    app.kubernetes.io/name: backrest
+    app.kubernetes.io/component: backup-system

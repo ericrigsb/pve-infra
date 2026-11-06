@@ -1,0 +1,44 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: status
+  namespace: docker-shared
+spec:
+  ports:
+    - port: 3001
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: status
+  namespace: docker-shared
+subsets:
+  - addresses:
+      - ip: 10.0.4.10
+    ports:
+      - port: 3001
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: status
+  namespace: docker-shared
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    external-dns.alpha.kubernetes.io/target: traefik.mesh.rigsb.net
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`status.mesh.rigsb.net`)
+      kind: Rule
+      services:
+        - name: status
+          port: 3001
+      middlewares:
+        - name: limit-buffering
+          namespace: traefik
+        - name: security-headers
+          namespace: traefik

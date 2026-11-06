@@ -1,0 +1,12 @@
+---
+# No handlers by design.
+#
+# This role must never restart nfs-server, smbd, or cockpit.socket. Restarting
+# nfs-server drops the exports, and every cluster PV mounts with `hard`, so a
+# stalled export becomes an application hang in immich, nextcloud, music
+# assistant, unifi, and backrest simultaneously rather than a visible error.
+#
+# This role used to end with `exportfs -ra`, re-exporting without dropping live
+# mounts. It no longer does: the role does not write an exports file at all (the
+# Cockpit file-sharing UI owns those), so there is nothing to re-export and
+# nothing to apply. `nfs-server` is only ever enabled, never restarted.

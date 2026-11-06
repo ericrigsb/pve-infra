@@ -1,0 +1,18 @@
+btbridge_app_dir: /opt/sendspin-client
+# Pinned upstream release. Kept in step with the README's install command so the
+# remediation printed on failure matches what is actually deployed.
+btbridge_app_version: v2.76.4
+btbridge_config_dir: /config
+btbridge_config_file: /config/config.json
+btbridge_dbus_mount: /bt-dbus
+btbridge_dbus_socket: /bt-dbus/system_bus_socket
+btbridge_web_port: 8080
+btbridge_base_listen_port: 8928
+# The host's bluetoothd is reached over D-Bus, so the container never runs its
+# own stack. bluetooth.service stays masked to prevent an accidental local
+# start, which crashes without a management socket and disrupts A2DP state.
+btbridge_services:
+  - dbus
+  - avahi-daemon
+  - pulseaudio-system
+  - sendspin-client

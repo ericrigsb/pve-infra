@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mailrise
+  namespace: mailrise
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mailrise
+  template:
+    metadata:
+      labels:
+        app: mailrise
+    spec:
+      # Stateless SMTP->Slack bridge (config is a ConfigMap), so a second
+      # replica costs nothing but node-loss immunity. Required anti-affinity
+      # keeps the two replicas apart.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: mailrise
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 300
+      containers:
+        - name: mailrise
+          image: yoryan/mailrise:latest
+          ports:
+            - containerPort: 8025
+          resources:
+            requests:
+              cpu: 150m
+              memory: 192Mi
+              # Ranking-only floor: keeps the pod out of kubelet's "usage above a
+              # zero request" eviction bucket. Not a limit.
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 375m
+              memory: 384Mi
+          env:
+            - name: SLACK_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: mailrise-slack
+                  key: SLACK_API_URL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/mailrise.conf
+              subPath: mailrise.conf
+      volumes:
+        - name: config
+          configMap:
+            name: mailrise-config

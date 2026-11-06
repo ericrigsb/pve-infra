@@ -1,0 +1,44 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: modem
+  namespace: docker-shared
+spec:
+  ports:
+    - port: 80
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: modem
+  namespace: docker-shared
+subsets:
+  - addresses:
+      - ip: 10.0.0.1
+    ports:
+      - port: 80
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: modem
+  namespace: docker-shared
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    external-dns.alpha.kubernetes.io/target: traefik.mesh.rigsb.net
+spec:
+  entryPoints:
+    - web
+    - websecure
+  routes:
+    - match: Host(`modem.mesh.rigsb.net`)
+      kind: Rule
+      services:
+        - name: modem
+          port: 80
+      middlewares:
+        - name: limit-buffering
+          namespace: traefik
+        - name: security-headers
+          namespace: traefik

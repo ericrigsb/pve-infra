@@ -1,0 +1,81 @@
+name: Reconcile Terraform State
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/*import*
+    paths:
+      - 'terraform/**'
+
+env:
+  TF_LOG: INFO
+  TF_WORKSPACE: terraform-gitea-actions
+  TF_VAR_pm_api_url: ${{ vars.PM_API_URL }}
+  TF_VAR_pm_api_token_id: ${{ secrets.PM_API_TOKEN_ID }}
+  TF_VAR_pm_api_token_secret: ${{ secrets.PM_API_TOKEN_SECRET }}
+  TF_VAR_pm_music_api_token_id: ${{ secrets.PM_MUSIC_API_TOKEN_ID }}
+  TF_VAR_pm_music_api_token_secret: ${{ secrets.PM_MUSIC_API_TOKEN_SECRET }}
+  TF_VAR_guest_root_password: ${{ secrets.GUEST_ROOT_PASSWORD }}
+  TF_VAR_pve_infra_ssh_key: ${{ secrets.PVE_INFRA_SSH_KEY }}
+  TF_VAR_pve_infra_ssh_public_key: ${{ secrets.PVE_INFRA_SSH_PUBLIC_KEY }}
+
+jobs:
+  reconcile-imports:
+    name: Reconcile Imports
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.GARAGE_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.GARAGE_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.GARAGE_ACCESS_KEY_SECRET }}" \
+            -backend-config="bucket=tfstate-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Validate
+        run: |
+          cd ./terraform
+          terraform validate
+
+      - name: Reattach migrated resources in state
+        run: |
+          set -euo pipefail
+          cd ./terraform
+
+          resources=(
+            "module.backup.proxmox_virtual_environment_container.lxc pve3/101"
+            "module.pihole.proxmox_virtual_environment_container.lxc pve3/102"
+            "module.gitea.proxmox_virtual_environment_container.lxc pve3/103"
+            "module.proxy.proxmox_virtual_environment_container.lxc pve3/104"
+            "module.music.proxmox_virtual_environment_container.lxc pve3/105"
+          )
+
+          for entry in "${resources[@]}"; do
+            addr="$(echo "$entry" | awk '{print $1}')"
+            rid="$(echo "$entry" | awk '{print $2}')"
+
+            if terraform state show "$addr" >/dev/null 2>&1; then
+              terraform state rm "$addr"
+            fi
+
+            terraform import "$addr" "$rid"
+          done
+
+      - name: Terraform Plan (post-reconcile)
+        run: |
+          cd ./terraform
+          terraform plan -refresh=true

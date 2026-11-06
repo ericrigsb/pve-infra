@@ -1,0 +1,36 @@
+# Read-only view of the restic repositories that the per-app backup CronJobs
+# write to. Backrest only ever reads from here; every repo carries
+# flags: ["--no-lock"] because restic's lock file writes fail on a read-only
+# mount (verified: 70s of lock-retry failures, then a hard error).
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: backrest-repo-pv
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes:
+    - ReadWriteMany
+  mountOptions:
+    - hard
+  nfs:
+    server: 10.0.4.8
+    path: /mnt/backup
+  persistentVolumeReclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backrest-repo-pvc
+  namespace: backrest
+  labels:
+    app.kubernetes.io/name: backrest
+    app.kubernetes.io/component: backup-system
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 100Gi
+  volumeName: backrest-repo-pv

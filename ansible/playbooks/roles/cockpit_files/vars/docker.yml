@@ -1,0 +1,93 @@
+# Per-host file-server settings for the `docker` VM (10.0.4.10).
+# Consumed by the `cockpit_files` role. See the role README.
+
+# --- Data mount ---
+# /mnt/share is a 3.6T USB passthrough disk (see AGENTS.md #11/#12 -- do NOT
+# add a `disk` block for it in docker.tf, that creates a second volume). It is
+# ext4 and mounted from the VM's OWN fstab by UUID:
+#
+#   UUID=ab9ee567-fa26-486d-873e-1e5b79033fec /mnt/share auto nosuid,nodev,nofail 0 0
+#
+# so this role asserts it but does not manage it. The `docker` role has its own
+# guard that fails the whole run if it is not mounted, because 10 PVs and the
+# redcloud workload live on it.
+cockpit_files_data_mountpoints:
+  - /mnt/share
+
+# --- Exports ---
+# RECORDED HERE, NOT DEPLOYED. The Cockpit file-sharing UI owns
+# /etc/exports.d/cockpit-file-sharing.exports and this role writes no exports
+# file of its own. What follows is the assertion the role checks the live UI
+# file against, so if you change an export in the UI, change it here too or CI
+# will fail. The `comment` keys are documentation only -- nothing renders them.
+#
+# All four copied from the live Cockpit UI export verbatim, including the
+# options that differ per path:
+#
+#   * `no_root_squash` on three of them -- the `backup` host does not use this.
+#     Deliberately preserved as-is; the rule is record reality, not normalise
+#     it against another host (AGENTS.md #12).
+#   * `sync` on uptime-kuma-pv only.
+#   * the Music export is `ro`, because it backs the music-assistant read-only
+#     PV that consumes the iTunes library.
+#
+# No -fsid is set: nothing in git references fsid (all 15 NFS PVs mount by
+# server+path) -- and the assertion ignores -fsid for the same reason.
+cockpit_files_exports:
+  - path: /mnt/share/osxphotos
+    comment: "consumed outside the cluster (no PV claims it)"
+    clients:
+      - 10.0.4.0/24
+    options:
+      - rw
+      - async
+      - no_subtree_check
+      - no_root_squash
+
+  - path: /mnt/share/k8s
+    comment: "immich, nextcloud, unifi, music-assistant, mongodb, redis, postgresql, backrest state"
+    clients:
+      - 10.0.4.0/24
+    options:
+      - rw
+      - async
+      - no_subtree_check
+      - no_root_squash
+
+  - path: /mnt/share/k8s/uptime-kuma-pv
+    comment: "exported separately from k8s/ and the only sync export"
+    clients:
+      - 10.0.4.0/24
+    options:
+      - rw
+      - sync
+      - no_subtree_check
+      - no_root_squash
+
+  - path: /mnt/share/Music/Music/Media.localized/Music
+    comment: "read-only music library for the music-assistant PV"
+    clients:
+      - 10.0.4.0/24
+    options:
+      - ro
+      - async
+      - no_subtree_check
+
+# --- Add-on versions ---
+# DIFFERENT from the `backup` host and NOT interchangeable. This host runs
+# cockpit-file-sharing 4.2.12 and Cockpit 314; `backup` runs 4.2.10 and 287.
+# The vendored 4.2.10 debs would DOWNGRADE the plugin that owns these four
+# exports and this host's live Samba shares.
+cockpit_files_addon_debs:
+  - name: cockpit-file-sharing
+    file: cockpit-file-sharing_4.2.12-1focal_all.deb
+    version: 4.2.12-1focal
+    sha256: 675c96d5c09f06e017c63495b7bb2cdb01bdbdbbcc4329d1b300d9ad45edc714
+  - name: cockpit-identities
+    file: cockpit-identities_0.1.12-1focal_all.deb
+    version: 0.1.12-1focal
+    sha256: 85d1412da210c86d0ebad35624fc512d895fd52f09ee0a8629cc1bc3bd0e825a
+  - name: cockpit-navigator
+    file: cockpit-navigator_0.5.10-1focal_all.deb
+    version: 0.5.10-1focal
+    sha256: 784b8b1d7e02224594d34e6d60945c72b54a557692a37fefbb0046146b74040e

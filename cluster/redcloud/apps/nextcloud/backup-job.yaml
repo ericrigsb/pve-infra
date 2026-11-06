@@ -1,0 +1,278 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nextcloud-backup
+  namespace: nextcloud
+  labels:
+    app: nextcloud-backup
+spec:
+  schedule: "30 6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # This job previously shared 06:30 with the music-assistant backup, which
+      # starved all three of its failures; the schedule was staggered in #496.
+      # All four backup CronJobs write to the same NFS export, so one retry
+      # covers a transient blip without piling on more load.
+      backoffLimit: 1
+      # Unstick a hard-mounted NFS hang, which would otherwise leave the pod
+      # running forever and block all future runs via concurrencyPolicy: Forbid.
+      # ~4x the slowest observed run (14m52s). This job also does a pg_dump and
+      # a maintenance-mode toggle, so it gets more headroom than unifi.
+      activeDeadlineSeconds: 3600
+      ttlSecondsAfterFinished: 86400
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+          - name: gitea-registry
+          serviceAccountName: nextcloud-backup-sa
+          containers:
+          - name: nextcloud-backup
+            image: gitea.mesh.rigsb.net/eric/backup-runner:latest
+            env:
+            - name: RESTIC_CACHE_DIR
+              value: "/tmp"
+            - name: RESTIC_PASSWORD_FILE
+              value: "/etc/restic-secret/password"
+            # Address a control-plane node directly instead of the unreliable
+            # kubernetes ClusterIP. kube_api() overrides this per call and fails
+            # over to the other node; this covers incidental kubectl calls.
+            # Keep in sync with cluster_endpoint in terraform/talos.tf.
+            - name: KUBERNETES_SERVICE_HOST
+              value: "10.0.4.2"
+            - name: KUBERNETES_SERVICE_PORT
+              value: "6443"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: nextcloud-db
+                  key: db-password
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              
+              source /scripts/backup-service.sh
+              mkdir -p /backup-temp
+              
+              # Clear maintenance mode no matter how this job exits. Left set,
+              # Nextcloud serves read-only to every user.
+              disable_maintenance_mode() {
+                echo "Disabling Nextcloud maintenance mode..."
+                kube_api exec -n nextcloud deployment/nextcloud -- \
+                  php occ maintenance:mode --off || true
+              }
+              trap disable_maintenance_mode EXIT
+              
+              # Simplified pre-backup function
+              nextcloud_pre_backup() {
+                echo "Enabling Nextcloud maintenance mode..."
+                if ! kube_api exec -n nextcloud deployment/nextcloud -- \
+                     php occ maintenance:mode --on; then
+                  echo "❌ Could not enable maintenance mode"
+                  # Still take the dump below. A dump of a live database can be
+                  # inconsistent, but it is far better than no dump at all, and
+                  # SOFT_FAILURE keeps the run from being reported as clean.
+                  SOFT_FAILURE="maintenance mode could not be enabled"
+                fi
+                
+                # The database is a StatefulSet, not a Deployment. Targeting
+                # deployment/postgresql silently skipped the dump for 9+ days
+                # because the hook's failure was only logged, never fatal.
+                echo "Creating database dump..."
+                local dump="/backup-temp/nextcloud-db-$(date +%Y%m%d-%H%M%S).sql"
+                if kube_api exec -n postgresql statefulset/postgresql -- \
+                     env PGPASSWORD="$PGPASSWORD" pg_dump -U postgres nextcloud > "$dump" 2>/tmp/pg_dump.err; then
+                  if [ -s "$dump" ]; then
+                    echo "Database dump created: $dump ($(wc -c < "$dump") bytes)"
+                  else
+                    echo "❌ pg_dump produced an empty file"
+                    SOFT_FAILURE="database dump was empty"
+                  fi
+                else
+                  echo "❌ pg_dump failed:"
+                  cat /tmp/pg_dump.err
+                  SOFT_FAILURE="database dump failed to create"
+                fi
+              }
+              
+              # Simplified post-backup function  
+              nextcloud_post_backup() {
+                # Clear maintenance mode promptly once the snapshot is done.
+                # The EXIT trap above is the safety net if we never get here.
+                disable_maintenance_mode
+                rm -f /backup-temp/nextcloud-db-*.sql
+              }
+
+              backup_service "Nextcloud" "/backup/k8s-nextcloud" "/var/www/html/data /var/www/html/config/config.php /var/www/html/custom_apps /backup-temp" "nextcloud_pre_backup" "nextcloud_post_backup"
+            volumeMounts:
+            - name: nextcloud-data
+              mountPath: /var/www/html
+              readOnly: true
+            - name: restic-secret
+              mountPath: /etc/restic-secret
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+            - name: backup-temp
+              mountPath: /backup-temp
+            - name: backup-scripts
+              mountPath: /scripts
+            resources:
+              requests:
+                cpu: 100m
+                memory: 256Mi
+                # restic writes its cache to RESTIC_CACHE_DIR=/tmp, which lives
+                # in the container rootfs and therefore counts against the
+                # node's ephemeral storage. Measured cache is <=29 MiB across
+                # all repos (2026-10-16), so 1Gi is ~30x headroom: if a cache
+                # ever outgrows it this job dies and is retried tomorrow, which
+                # is the intended trade against evicting the cluster ingress.
+                ephemeral-storage: 128Mi
+              limits:
+                cpu: 300m
+                memory: 512Mi
+                ephemeral-storage: 1Gi
+          securityContext:
+            runAsUser: 33
+            runAsGroup: 33
+            fsGroup: 0
+          volumes:
+          - name: nextcloud-data
+            persistentVolumeClaim:
+              claimName: nextcloud-pvc
+          - name: restic-secret
+            secret:
+              secretName: restic-secret
+          - name: backup-storage
+            persistentVolumeClaim:
+              claimName: backup-storage-pvc
+          - name: backup-temp
+            emptyDir:
+              # Bounded deliberately. A container's ephemeral-storage limit only
+              # covers the container rootfs -- mounted volumes are accounted
+              # separately at pod level -- so the pg_dump staged here needs its
+              # own cap. Measured dump is 179 MB (nextcloud DB, 2026-10-16), so
+              # 2Gi is ~10x headroom. Past that kubelet evicts THIS job instead
+              # of letting the node cross its 15% free-space threshold, which is
+              # what evicted traefik on 2026-10-16 07:55.
+              sizeLimit: 2Gi
+          - name: backup-scripts
+            configMap:
+              name: backup-scripts
+              defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nextcloud-backup-sa
+  namespace: nextcloud
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nextcloud-backup-role
+  namespace: nextcloud
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nextcloud-backup-binding
+  namespace: nextcloud
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nextcloud-backup-role
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-backup-sa
+  namespace: nextcloud
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nextcloud-backup-cluster-role
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nextcloud-backup-cluster-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nextcloud-backup-cluster-role
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-backup-sa
+  namespace: nextcloud
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-secrets-reader
+  namespace: nextcloud
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nextcloud-backup-secrets-binding
+  namespace: nextcloud
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-backup-sa
+  namespace: nextcloud
+roleRef:
+  kind: Role
+  name: backup-secrets-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nextcloud-backup-pg-role
+  namespace: postgresql
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec"]
+  verbs: ["get", "list", "create", "update", "patch"]
+# The PostgreSQL workload is a StatefulSet, so `kubectl exec
+# statefulset/postgresql` needs to read it to resolve the target pod.
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nextcloud-backup-pg-binding
+  namespace: postgresql
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: nextcloud-backup-pg-role
+subjects:
+- kind: ServiceAccount
+  name: nextcloud-backup-sa
+  namespace: nextcloud

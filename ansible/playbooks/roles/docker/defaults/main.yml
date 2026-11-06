@@ -1,0 +1,125 @@
+---
+# Defaults for the Docker workload host (VM 100, `docker`).
+#
+# This role owns the Docker installation and the hand-managed compose stack that
+# used to live only in the separate `redcloud` repository. Non-secret settings
+# are declared here so git documents them; the three secret values are read from
+# the environment at apply time and are never committed.
+
+# Repository root, derived from this playbook's location:
+# ansible/playbooks/<host>.yml -> playbook_dir is ansible/playbooks -> up two
+# levels is the repo root. Used to reach workloads/ so the stack definitions
+# exist in exactly one place in the repository.
+docker_repo_root: "{{ playbook_dir }}/../.."
+docker_workload_src: "{{ docker_repo_root }}/workloads/docker"
+
+# The compose project lives on the 3.6T data disk and must stay there: the
+# bind-mount targets in docker-compose.yml (garage/{meta,data}, lidarr/config,
+# uptime-kuma/data, gitea-runner/data, slskd/config, soularr/data,
+# shared-downloads) all hold state that has no other copy. See AGENTS.md
+# section 11.
+docker_workload_dir: /mnt/share/projects/redcloud
+
+# Bind-mount directory targets that must exist before `docker compose up`.
+# Exactly the set of `./<dir>` bind-mount sources in
+# workloads/docker/docker-compose.yml -- derived from the compose file, not
+# assumed. Modes are the host's existing modes, recorded individually rather than
+# normalised: Garage's, soularr's, uptime-kuma's and shared-downloads' are 0775
+# (the containers create them with their PUID/PGID) while gitea-runner's,
+# lidarr's and slskd's are 0755. Forcing one value across all of them would
+# strip group-write from paths that have it, so the map below keeps the first
+# Ansible run a genuine no-op on permissions. Verified per-directory against the
+# host on 2026-10-01; re-check with the docker_workload probe before changing
+# one.
+#
+# slskd/config and soularr/data are listed even though their services are
+# disabled in the compose file. They already exist on the host with these exact
+# modes, so listing them is a no-op today and means re-enabling either service
+# does not depend on this role having created its directory.
+#
+# Note what is NOT here:
+#   * garage/config.toml and gitea-runner/config.yaml are bind-mounted *files*,
+#     deployed by this role / by the gitea-runner container respectively.
+#   * navidrome/data exists on the host but no navidrome service is declared, so
+#     it is stale. Left untouched -- deleting it is a data decision, not a
+#     reconcile.
+docker_workload_state_dirs:
+  garage/meta: "0775"
+  garage/data: "0775"
+  soularr/data: "0775"
+  shared-downloads: "0775"
+  uptime-kuma/data: "0775"
+  gitea-runner/data: "0755"
+  lidarr/config: "0755"
+  slskd/config: "0755"
+
+# --- compose .env -------------------------------------------------------
+# Verified against the live file on 2026-10-01. PUID/PGID are stored as literal
+# `${PUID:-1000}` strings there; that is reproduced verbatim rather than
+# "corrected", because Docker Compose does not shell-expand env_file values, so
+# changing it would change what the containers actually receive.
+docker_env_values:
+  TZ: America/New_York
+  CONFIG_FILE: /config.yaml
+  GITEA_INSTANCE_URL: http://gitea.lan:3000
+  PUID: "${PUID:-1000}"
+  PGID: "${PGID:-1000}"
+  # slskd is disabled in workloads/docker/docker-compose.yml, but its settings
+  # are kept here on purpose: re-enabling it should be an uncomment, not a
+  # round trip to rediscover the values. They are inert until the service is
+  # uncommented, and the values are preserved verbatim from the live .env.
+  SLSKD_SLSK_USERNAME: riggo18
+  SLSKD_REMOTE_CONFIGURATION: "true"
+  SCRIPT_INTERVAL: "300"
+  WEBUI_ENABLED: "true"
+
+# To re-enable slskd: uncomment its service block in
+# workloads/docker/docker-compose.yml, add slskd/config back to
+# docker_workload_state_dirs, and make sure DOCKER_SLSKD_SLSK_PASSWORD exists in
+# Gitea. Nothing else needs to change.
+
+# Secret values are not stored here. They are read from the environment by
+# tasks/main.yml and injected into the .env at apply time, so they are never
+# committed. See the DOCKER_*_SECRET entries in
+# .gitea/workflows/provision.yml for the full list.
+
+# --- restic host backup -------------------------------------------------
+# backup.sh, backup.service and backup.timer are deployed from
+# workloads/docker/restic/. The repository credentials and the path list are
+# NOT managed here: /etc/backup/restic_env and /etc/backup/paths are root-only
+# and cannot be read without inventing values, so the role asserts their
+# presence and leaves them alone. That is a deliberate, recorded gap.
+docker_backup_dir: /etc/backup
+docker_backup_unit_dir: /etc/systemd/system
+docker_backup_files:
+  - backup.sh
+docker_backup_units:
+  - backup.service
+  - backup.timer
+docker_backup_script_mode: "0700"
+docker_backup_unit_mode: "0644"
+docker_backup_timer: backup.timer
+
+# Root-only inputs owned by hand. Asserted, never written.
+docker_backup_unmanaged_files:
+  - restic_env
+  - paths
+  - pw
+
+# --- behaviour toggles -------------------------------------------------
+# `missing` means: pull an image only if it is not already present locally.
+# This is the safe reconcile default. `always` means "upgrade the stack" --
+# set it deliberately in a reviewed change, never as a side effect.
+#
+# Five of the six services are pinned to a floating tag (:latest), so `always`
+# silently replaces running images with whatever upstream published, and
+# `--remove-orphans` means an accidentally removed service block deletes live
+# containers. Pin the tags before ever setting this to `always`.
+docker_workload_pull_policy: missing
+
+# The compose project directory lives on the 3.6T USB data disk. 14 of the 16
+# live Kubernetes PersistentVolumes resolve through {{ docker_data_mountpoint }},
+# which is mounted `nofail` and tracked in neither Terraform nor Proxmox state.
+# The role asserts it is present, because reconciling the compose stack without
+# it would create every bind mount on the root filesystem.
+docker_data_mountpoint: /mnt/share

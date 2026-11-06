@@ -1,0 +1,339 @@
+name: Provision
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    paths:
+      - 'ansible/**'
+      - 'terraform/**'
+      - 'workloads/**'
+  pull_request_target:
+    types:
+      - closed
+    branches:
+      - main
+    paths:
+      - 'ansible/**'
+      - 'terraform/**'
+      - 'workloads/**'
+
+env:
+  TF_LOG: ERROR
+  TF_WORKSPACE: terraform-gitea-actions
+  TF_VAR_pm_api_url: ${{ vars.PM_API_URL }}
+  TF_VAR_pm_api_token_id: ${{ secrets.PM_API_TOKEN_ID }}
+  TF_VAR_pm_api_token_secret: ${{ secrets.PM_API_TOKEN_SECRET }}
+  TF_VAR_pm_music_api_token_id: ${{ secrets.PM_MUSIC_API_TOKEN_ID }}
+  TF_VAR_pm_music_api_token_secret: ${{ secrets.PM_MUSIC_API_TOKEN_SECRET }}
+  TF_VAR_guest_root_password: ${{ secrets.GUEST_ROOT_PASSWORD }}
+  TF_VAR_pve_infra_ssh_key: ${{ secrets.PVE_INFRA_SSH_KEY }}
+  TF_VAR_pve_infra_ssh_public_key: ${{ secrets.PVE_INFRA_SSH_PUBLIC_KEY }}
+  GUEST_USER: ${{ vars.GUEST_USER }}
+  GUEST_USER_PASSWORD: ${{ secrets.GUEST_USER_PASSWORD }}
+  GUEST_USER_PUBLIC_KEY: ${{ secrets.GUEST_USER_PUBLIC_KEY }}
+  NORDVPN_AUTH_TOKEN: ${{ secrets.NORDVPN_AUTH_TOKEN }}
+  TECHNITIUM_URL: ${{ vars.TECHNITIUM_URL }}
+  TECHNITIUM_API_TOKEN: ${{ secrets.TECHNITIUM_API_TOKEN }}
+  # Compose stack secrets for the docker VM (workloads/docker). If any of these
+  # is unset the `docker` role leaves the live .env untouched rather than
+  # writing blanks -- see ansible/playbooks/roles/docker/tasks/main.yml.
+  # DOCKER_SLSKD_SLSK_PASSWORD is held even though slskd is disabled in the
+  # compose file, so re-enabling it needs no secret round-trip.
+  DOCKER_GITEA_RUNNER_REGISTRATION_TOKEN: ${{ secrets.DOCKER_GITEA_RUNNER_REGISTRATION_TOKEN }}
+  DOCKER_GARAGE_RPC_SECRET: ${{ secrets.DOCKER_GARAGE_RPC_SECRET }}
+  DOCKER_SLSKD_SLSK_PASSWORD: ${{ secrets.DOCKER_SLSKD_SLSK_PASSWORD }}
+
+jobs:
+  check-terraform:
+    name: Lint and Plan Terraform
+    runs-on: [ubuntu-latest]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: terraform-changes
+        run: |
+          if git diff --name-only origin/main..HEAD | grep -q '^terraform/'; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+
+      - name: Terraform Init
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.GARAGE_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.GARAGE_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.GARAGE_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tfstate-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Validate
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform validate
+
+      - name: Terraform Plan
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform plan
+
+  check-ansible:
+    name: Lint Ansible
+    runs-on: [ansible-runner]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ansible changes
+        id: ansible-changes
+        run: |
+          if git diff --name-only origin/main..HEAD | grep -qE '^(ansible|workloads)/'; then
+            echo "ansible_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ansible Lint
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          ansible-lint ansible/playbooks/
+
+  check-playbooks:
+    name: Dry Run Playbooks
+    runs-on: [ansible-runner]
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    needs: check-ansible
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ansible changes
+        id: ansible-changes
+        run: |
+          if git diff --name-only origin/main..HEAD | grep -qE '^(ansible|workloads)/'; then
+            echo "ansible_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get SSH Key
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          echo "${{ secrets.PVE_INFRA_SSH_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+
+      # Same inputs as provision-ansible: the guest list comes from Terraform
+      # state, and ansible.sh resolves each address at runtime. Guest addresses
+      # are not Terraform outputs, so there is nothing to hardcode here.
+      - name: Get Terraform Outputs for Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.GARAGE_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.GARAGE_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.GARAGE_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tfstate-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+          terraform output -json vms > vms.json
+          jq '[.[] | select(.vm_type != "talos")]' vms.json > non_talos_vms.json
+
+      # Dry run only. `validate` is ansible.sh with --check --diff, so this is
+      # the same playbooks and the same guests that provision-ansible will run
+      # after merge, just without the writes. It exists to surface a bad render
+      # BEFORE merge: the first real deploy of docker/.env is a rewrite, so a
+      # secret pasted into the Gitea UI with a trailing newline would otherwise
+      # show up as a broken gitea-runner on its next restart, well after the run
+      # that caused it.
+      #
+      # Note --check is not a sandbox. It runs as root against the live guests,
+      # and handlers DO fire under it. Every module used here is check-mode
+      # aware, so nothing mutates: `command` is skipped, and systemd/apt report
+      # the change they would make without making it. Adding a handler that
+      # writes, or a check_mode: false task, breaks that guarantee -- review
+      # carefully before adding either.
+      - name: Dry Run Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          chmod a+x ansible/ansible.sh
+          ansible/ansible.sh validate \
+            "${PWD}/ssh_key.pem" \
+            ./terraform/non_talos_vms.json
+
+  provision-terraform:
+    name: Provision Infrastructure
+    runs-on: [ubuntu-latest]
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+    outputs:
+      terraform_changed: ${{ steps.terraform-changes.outputs.terraform_changed }}
+      ssh_key_path: ${{ steps.terraform_outputs.outputs.ssh_key_path }}
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Terraform changes
+        id: terraform-changes
+        run: |
+          if git diff --name-only origin/main~1..HEAD | grep -q '^terraform/'; then
+            echo "terraform_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "terraform_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+
+      - name: Terraform Init
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.GARAGE_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.GARAGE_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.GARAGE_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tfstate-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+
+      - name: Terraform Plan
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform plan -refresh=true
+
+      - name: Terraform Apply
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform apply -auto-approve
+
+      - name: Get Terraform Outputs
+        id: terraform_outputs
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform output -json vms > vms.json
+          jq '[.[] | select(.vm_type != "talos")]' vms.json > non_talos_vms.json
+          echo "${{ secrets.PVE_INFRA_SSH_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+          echo "ssh_key_path=${PWD}/ssh_key.pem" >> "$GITHUB_OUTPUT"
+          terraform output -raw talosconfig > talosconfig
+          terraform output -raw kubeconfig > kubeconfig
+          chmod 600 talosconfig kubeconfig
+
+      - name: Upload Kubernetes configs
+        if: steps.terraform-changes.outputs.terraform_changed == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: pve-kubernetes-config
+          path: |
+            terraform/kubeconfig
+            terraform/talosconfig
+          retention-days: 1
+
+  provision-ansible:
+    name: Run Ansible
+    runs-on: [ansible-runner]
+    needs: provision-terraform
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.merged == true
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for Ansible changes
+        id: ansible-changes
+        run: |
+          if git diff --name-only origin/main~1..HEAD | grep -qE '^(ansible|workloads)/'; then
+            echo "ansible_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ansible_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get SSH Key and VM Data
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          echo "${{ secrets.PVE_INFRA_SSH_KEY }}" > ssh_key.pem
+          chmod 600 ssh_key.pem
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+
+      - name: Get Terraform Outputs for Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          cd ./terraform
+          terraform init \
+            -backend-config='endpoints={s3="${{ vars.GARAGE_ENDPOINT_URL }}"}' \
+            -backend-config="access_key=${{ secrets.GARAGE_ACCESS_KEY  }}" \
+            -backend-config="secret_key=${{ secrets.GARAGE_ACCESS_KEY_SECRET  }}" \
+            -backend-config="bucket=tfstate-pve" \
+            -backend-config="key=tf-state-pve.tfstate" \
+            -backend-config="region=us-east-1" \
+            -backend-config="skip_requesting_account_id=true" \
+            -backend-config="skip_credentials_validation=true" \
+            -backend-config="skip_metadata_api_check=true" \
+            -backend-config="skip_region_validation=true" \
+            -backend-config="use_path_style=true" \
+            -input=false
+          terraform output -json vms > vms.json
+          jq '[.[] | select(.vm_type != "talos")]' vms.json > non_talos_vms.json
+
+      - name: Validate Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          chmod a+x ansible/ansible.sh
+          ansible/ansible.sh validate \
+            "${PWD}/ssh_key.pem" \
+            ./terraform/non_talos_vms.json
+
+      - name: Run Ansible
+        if: steps.ansible-changes.outputs.ansible_changed == 'true'
+        run: |
+          chmod a+x ansible/ansible.sh
+          ansible/ansible.sh provision \
+            "${PWD}/ssh_key.pem" \
+            ./terraform/non_talos_vms.json

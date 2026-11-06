@@ -1,0 +1,13 @@
+[Unit]
+Description=Sendspin source client (analog-in -> Music Assistant)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{ streamer_venv_dir }}/bin/python {{ streamer_bin_dir }}/sendspin_source_client.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,69 @@
+# Cockpit file-sharing role -- ansible/playbooks/roles/cockpit_files.
+#
+# Owns the file-server PACKAGE layer and the NFS exports on a host running
+# the 45Drives Cockpit add-ons.
+#
+# It deliberately does NOT own anything the cockpit-file-sharing add-on
+# generates at runtime -- see tasks/main.yml and AGENTS.md #11/#12.
+#
+# Per-host values (exports, mounts, add-on versions) live in host_vars, not
+# here, because the two hosts that use this role differ in all three. Do not
+# assume anything about a host from another host's file:
+#
+#   backup  LXC 101  debian bookworm  /mnt/backup   NTFS, propagated from pve2
+#   docker  VM  100  ubuntu noble     /mnt/share    ext4, mounted from fstab
+#
+# Neither guest is fully rebuildable from git -- see README.md "Outstanding".
+
+# --- Native packages ---
+# Managed normally. NOTE: `state: present` only installs if missing, so this
+# never upgrades a host's packages. That is deliberate: the two hosts run
+# different Cockpoint majors (287 on bookworm, 314 on noble) and both are
+# working. This role can restore a missing package, not converge a version.
+cockpit_files_native_packages:
+  - cockpit
+  - samba
+  - nfs-kernel-server
+  - nfs-common
+
+# --- 45Drives add-ons ---
+# NOT in any configured apt repo on either host -- they were `dpkg -i`'d from
+# downloaded .deb files. Installed from files/debs/ so a rebuild needs no
+# network and no Ubuntu apt source on a Debian host. Checksum-verified before
+# install: an unverified deb landing in files/debs/ should stop a run, not
+# execute.
+#
+# cockpit_files_addon_debs has NO default on purpose. Versions are PER HOST and
+# not interchangeable -- `backup` runs file-sharing 4.2.10 and `docker` runs
+# 4.2.12 -- so a default here would be a silent way to install the wrong
+# version on a host whose vars/ entry was forgotten. Each host must state its
+# own set in vars/<hostname>.yml, and the role asserts it is present.
+#
+# There is deliberately no `allow_downgrade`: if a host's installed version is
+# newer than what is vendored, apt refusing is the correct outcome, because it
+# means the vendored set is stale for that host and a human should look.
+
+# Where the .deb files live in THIS repository, on the controller. This is
+# role_path/files/debs, NOT playbook_dir/files/debs: playbook_dir is
+# ansible/playbooks, so the latter resolves to a directory that does not exist.
+# `role_path` is the role's own directory and always points at files/.
+cockpit_files_debs_dir: "{{ role_path }}/files/debs"
+
+# Where the verified .deb files are staged on the guest before install. apt is
+# given a guest-side path, because a controller-side path does not exist there.
+cockpit_files_stage_dir: /var/cache/cockpit-files-addons
+
+# Fallbacks. Every host using this role must define both -- the tasks fail
+# explicitly if they are missing rather than silently exporting nothing.
+cockpit_files_data_mountpoints: []
+cockpit_files_exports: []
+# The Cockpit add-on's OWN exports file. This role only READS this path and
+# compares it against cockpit_files_exports; it never writes it.
+#
+# There is deliberately no "managed exports file" variable. An earlier version
+# of this role wrote a second file, /etc/exports.d/ansible-file-sharing.exports,
+# alongside the UI's. exportfs(5) reads every *.exports in the directory, so both
+# were live at once and any export removed in the UI stayed exported anyway --
+# the change appeared to succeed and then silently did nothing. The UI is the
+# only writer. See AGENTS.md #12.
+cockpit_files_ui_exports_file: /etc/exports.d/cockpit-file-sharing.exports

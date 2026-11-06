@@ -1,0 +1,20 @@
+- name: Backup
+  hosts: all
+  roles:
+    - common
+    # Owns the package layer and the NFS export backing every restic repo in
+    # the cluster. The data mount is asserted, not managed, and everything the
+    # Cockpit UI generates is left alone -- see roles/cockpit_files/README.md
+    # and AGENTS.md #12.
+    - role: cockpit_files
+      vars:
+        # ansible.sh runs with `-i "$IP,"`, so inventory_hostname is a bare IP
+        # and a role-local host_vars/ would never be auto-loaded. Naming the
+        # file explicitly keeps the key a hostname. See the role README.
+        # The var is not called `vars_files` because that is an Ansible
+        # reserved name (ansible-lint var-naming/no-reserved).
+        cockpit_files_vars_file: vars/backup.yml
+      # Loaded by the role's own include_vars task, not by a `vars_files:`
+      # keyword here. One mechanism, not two, and it keeps the role's
+      # "was a vars file named?" assertion meaningful. (ansible-lint also
+      # misreads the `vars_files` keyword as a reserved variable name.)

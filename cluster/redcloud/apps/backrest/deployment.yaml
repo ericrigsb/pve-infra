@@ -1,0 +1,177 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backrest
+  namespace: backrest
+  labels:
+    app.kubernetes.io/name: backrest
+    app.kubernetes.io/component: backup-system
+spec:
+  # The oplog sqlite database is exclusively locked and a second instance calls
+  # zap.Fatal on ErrLocked (cmd/backrest/backrest.go:167), and config.json is
+  # rewritten in place. One replica, and Recreate so a rollout never has two
+  # pods writing the same state volume.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backrest
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backrest
+        app.kubernetes.io/component: backup-system
+    spec:
+      # Service links are disabled deliberately. With them on, the kubelet
+      # injects BACKREST_SERVICE_HOST, BACKREST_PORT_9898_TCP and friends into
+      # every container in the namespace. Because the Service is itself named
+      # "backrest", that collides with Backrest's own bind-address variable
+      # (internal/env/environment.go:18), and BACKREST_PORT arrives as the URL
+      # "tcp://10.108.221.84:9898". Backrest passes that straight to
+      # net.Listen, which fails with "too many colons in address" and the
+      # process crash-loops. Reproduced and verified fixed on Talos 1.11 /
+      # kubelet v1.34.0.
+      enableServiceLinks: false
+      initContainers:
+      - name: seed-config
+        image: busybox:1.36
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -eu
+          mkdir -p /var/lib/backrest/config /var/lib/backrest/data
+          CFG=/var/lib/backrest/config/config.json
+          if [ -f "$CFG" ]; then
+            # Self-heal a config seeded by an earlier revision, which wrote the
+            # raw "$2y$..." string where Backrest expects base64. Without this
+            # the decode in internal/auth/auth.go:121 yields garbage and every
+            # login is rejected. A correctly-seeded file holds base64, which
+            # never starts with '$2', so this is a no-op on good configs.
+            if grep -q '"passwordBcrypt": "\$2' "$CFG"; then
+              echo "migrating passwordBcrypt from raw bcrypt to base64"
+              sed -n 's/.*"passwordBcrypt": "\(\$2[aby]\$[^"]*\)".*/\1/p' "$CFG" \
+                | head -1 | tr -d '\n' | base64 | tr -d '\n' > /var/lib/backrest/.b64
+              B64=$(cat /var/lib/backrest/.b64)
+              rm -f /var/lib/backrest/.b64
+              if printf '%s' "$B64" | base64 -d | grep -q '^\$2[aby]\$'; then
+                sed "s|\"\$2[aby]\$[^\"]*\"|\"${B64}\"|" "$CFG" > "$CFG.tmp"
+                mv "$CFG.tmp" "$CFG"
+                echo "migrated passwordBcrypt to base64"
+              else
+                echo "ERROR: could not re-encode stored bcrypt hash" >&2
+                exit 1
+              fi
+            else
+              echo "config.json already present - leaving it untouched so UI changes survive restarts"
+            fi
+            exit 0
+          fi
+          # Backrest does not store a bcrypt string; it stores the raw bcrypt
+          # bytes base64-encoded (internal/auth/auth.go:121 does
+          # base64.StdEncoding.DecodeString on the field before comparing).
+          # The secret holds the standard "$2y$..." string, so base64 it here.
+          BCRYPT_B64=$(printf '%s' "$BACKREST_ADMIN_BCRYPT" | base64 | tr -d '\n')
+          if printf '%s' "$BCRYPT_B64" | base64 -d | grep -q '^\$2[aby]\$'; then
+            echo "bcrypt hash encoded ok ($(printf '%s' "$BCRYPT_B64" | base64 -d | wc -c | tr -d ' ') bytes)"
+          else
+            echo "ERROR: encoded secret is not a bcrypt hash" >&2
+            exit 1
+          fi
+          # The bcrypt hash arrives via env, so the shell never re-parses its
+          # '$' characters. The base64 form contains no '|' and no '&', so it
+          # is safe as a sed replacement with a '|' delimiter.
+          sed "s|__BACKREST_ADMIN_BCRYPT__|${BCRYPT_B64}|" \
+            /seed/config.json.template > /var/lib/backrest/config/config.json.tmp
+          if grep -q '__BACKREST_ADMIN_BCRYPT__' /var/lib/backrest/config/config.json.tmp; then
+            echo "ERROR: placeholder was not substituted" >&2
+            exit 1
+          fi
+          mv /var/lib/backrest/config/config.json.tmp /var/lib/backrest/config/config.json
+          echo "seeded /var/lib/backrest/config/config.json"
+        env:
+        - name: BACKREST_ADMIN_BCRYPT
+          valueFrom:
+            secretKeyRef:
+              name: backrest-admin
+              key: passwordBcrypt
+        volumeMounts:
+        - name: seed
+          mountPath: /seed
+          readOnly: true
+        - name: backrest
+          mountPath: /var/lib/backrest
+      containers:
+      - name: backrest
+        image: ghcr.io/garethgeorge/backrest:v1.14.1
+        imagePullPolicy: IfNotPresent
+        env:
+        # The state PVC is mounted once, so the image's default paths
+        # (/config/config.json and /data) are overridden to point into it.
+        # Backrest creates these directories itself - see
+        # internal/config/jsonstore.go:89 and
+        # internal/oplog/sqlitestore/sqlitestore.go:55.
+        - name: BACKREST_CONFIG
+          value: /var/lib/backrest/config/config.json
+        - name: BACKREST_DATA
+          value: /var/lib/backrest/data
+        # Set explicitly as well as disabling service links above. The image's
+        # docker-entrypoint only fills in BACKREST_PORT when it is empty, so
+        # naming it here keeps the listen address correct and readable even if
+        # service links are ever re-enabled.
+        - name: BACKREST_PORT
+          value: 0.0.0.0:9898
+        # Backrest hands its entire process environment to restic
+        # (internal/orchestrator/repo/repo.go:42), so the repos resolve their
+        # password from here. The restic password therefore never appears in
+        # config.json or anywhere in git.
+        - name: RESTIC_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: restic-secret
+              key: password
+        volumeMounts:
+        - name: backrest
+          mountPath: /var/lib/backrest
+        - name: repo-storage
+          mountPath: /backup
+          readOnly: true
+        - name: cache
+          mountPath: /cache
+        # tcpSocket rather than httpGet: /metrics lives on the authenticated
+        # mux, so an unauthenticated HTTP probe would just get a redirect.
+        readinessProbe:
+          tcpSocket:
+            port: 9898
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 9898
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            memory: 512Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: seed
+        configMap:
+          name: backrest-seed-config
+      - name: backrest
+        persistentVolumeClaim:
+          claimName: backrest-state-pvc
+      - name: repo-storage
+        persistentVolumeClaim:
+          claimName: backrest-repo-pvc
+          readOnly: true
+      - name: cache
+        emptyDir: {}

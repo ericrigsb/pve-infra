@@ -1,0 +1,391 @@
+---
+# The Docker workload host: Docker itself plus the compose stack that used to be
+# deployed by hand out of the separate `redcloud` repository.
+#
+# Ordering matters in three places:
+#   * The data-disk check runs before anything that writes under the mount. It is
+#     a precondition, not a report: every task from the workload directories
+#     onward creates something under /mnt/share, so a check that ran later would
+#     leave behind the very tree it exists to prevent.
+#   * Docker's apt repository is only added when Docker is not already
+#     installed, and the install uses `state: present` so an existing engine is
+#     never upgraded. Adding the repository would otherwise make a newer
+#     version available and `apt install` would pull it in, changing the engine
+#     under running containers.
+#   * State directories are created before compose is reconciled, because the
+#     bind-mount targets hold the only copy of the service data.
+
+# 14 of the 16 live PersistentVolumes resolve through this mount. It is a USB
+# passthrough disk: no Terraform resource, no Proxmox state file, and mounted
+# `nofail` -- so if it is absent the host boots normally and the cluster's PVs
+# fail to mount, which is a silent data outage rather than a loud one. The
+# compose stack's bind mounts would also be created on the root filesystem, in a
+# directory tree that looks correct and holds nothing. Fail before touching it.
+- name: Check the data disk is mounted
+  ansible.builtin.command:
+    cmd: "findmnt --noheadings --output TARGET {{ docker_data_mountpoint }}"
+  register: docker_data_mount
+  changed_when: false
+  failed_when: false
+  # check_mode: false is required. `command` is skipped in check mode by
+  # default, which would leave rc undefined, make this guard fire, and fail every
+  # `--check` run -- including CI's validate mode. This task only reads.
+  check_mode: false
+
+- name: Fail if the data disk is not mounted
+  ansible.builtin.fail:
+    msg: >-
+      {{ docker_data_mountpoint }} is not mounted. This host exports the NFS
+      shares behind 14 of 16 Kubernetes PersistentVolumes (immich library,
+      nextcloud, music-assistant, unifi, mongodb, redis, backrest state,
+      osxphotos), so continuing would reconcile a compose stack whose bind
+      mounts land on the root filesystem instead. The disk is a USB passthrough
+      device and is not tracked in Terraform -- see AGENTS.md section 11.
+      Reattach it, then re-run.
+  when: docker_data_mount.rc != 0 or docker_data_mount.stdout | trim | length == 0
+
+# Controller-side check. Must delegate to localhost: without it, `stat` runs on
+# the guest, where the controller's checkout does not exist.
+- name: Verify the vendored workload definitions are present
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ docker_workload_src }}/docker-compose.yml"
+    - "{{ docker_workload_src }}/garage/config.toml"
+    - "{{ docker_workload_src }}/restic/backup.sh"
+  delegate_to: localhost
+  become: false
+  register: docker_workload_src_stat
+  changed_when: false
+
+- name: Fail if the vendored workload definitions are missing
+  ansible.builtin.assert:
+    that: item.stat.exists
+    fail_msg: >-
+      {{ item.item }} is missing from {{ docker_workload_src }}. This role
+      deploys workload definitions that live in this repository; if they were
+      moved or deleted, the stack cannot be reconciled.
+    quiet: true
+  loop: "{{ docker_workload_src_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# ---------------------------------------------------------------------------
+# Docker
+# ---------------------------------------------------------------------------
+
+- name: Check for an existing Docker installation
+  ansible.builtin.stat:
+    path: /etc/docker
+  register: docker_etc_stat
+  changed_when: false
+
+- name: Install Docker apt repository prerequisites
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+  when: not docker_etc_stat.stat.exists
+
+- name: Ensure the apt keyring directory exists
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+  when: not docker_etc_stat.stat.exists
+
+- name: Install the Docker apt signing key
+  ansible.builtin.get_url:
+    url: >-
+      https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  when: not docker_etc_stat.stat.exists
+
+# A plain sources.list.d line rather than `apt_repository`: that module is
+# deprecated in ansible-core 2.21 and the replacement (deb822_repository) is not
+# available in every ansible-core the CI runner may have. One templated line is
+# idempotent, reviewable, and works on both old and new.
+- name: Add the Docker apt repository
+  ansible.builtin.template:
+    src: docker.list.j2
+    dest: /etc/apt/sources.list.d/docker.list
+    mode: "0644"
+  when: not docker_etc_stat.stat.exists
+
+- name: Update apt cache after adding the Docker repository
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: not docker_etc_stat.stat.exists
+
+# state=present, not latest: never move an already-installed engine.
+- name: Install Docker and the Compose plugin
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - docker-ce-containerd
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+  when: not docker_etc_stat.stat.exists
+
+- name: Hold Docker packages to prevent upgrade
+  # The hold is pre-existing and deliberate: five of six compose services are
+  # pinned to a floating tag, so an unattended engine upgrade combined with a
+  # repull is how a running stack changes without anyone changing git. It also
+  # means these packages receive no security updates via the `common` role's
+  # dist-upgrade. See AGENTS.md section 11.
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - docker-ce
+    - docker-ce-cli
+    - docker-ce-rootless-extras
+    - containerd.io
+    - docker-compose-plugin
+  failed_when: false
+
+- name: Ensure Docker is enabled and running
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# Workload directories
+# ---------------------------------------------------------------------------
+
+- name: Ensure the compose project directory exists
+  ansible.builtin.file:
+    path: "{{ docker_workload_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Ensure compose bind-mount state directories exist
+  # state=directory only: these hold the sole copy of Garage metadata, lidarr's
+  # config and uptime-kuma data, and the role never writes into them or removes
+  # them. Modes come from docker_workload_state_dirs, which
+  # records the host's existing modes so this task is a no-op on permissions.
+  ansible.builtin.file:
+    path: "{{ docker_workload_dir }}/{{ item.key }}"
+    state: directory
+    mode: "{{ item.value }}"
+  loop: "{{ docker_workload_state_dirs | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+# ---------------------------------------------------------------------------
+# Compose environment
+# ---------------------------------------------------------------------------
+
+# Compose secret keys -> environment variable holding the value. The workflow
+# (.gitea/workflows/provision.yml) exports each one from a Gitea Actions secret.
+- name: Collect the compose environment secrets
+  ansible.builtin.set_fact:
+    docker_workload_secrets:
+      DOCKER_GITEA_RUNNER_REGISTRATION_TOKEN: >-
+        {{ lookup('env', 'DOCKER_GITEA_RUNNER_REGISTRATION_TOKEN') }}
+      DOCKER_GARAGE_RPC_SECRET: "{{ lookup('env', 'DOCKER_GARAGE_RPC_SECRET') }}"
+      # slskd is disabled in the compose file, but the value is kept so that
+      # re-enabling it does not require rediscovering the password. Holding an
+      # unused secret is the cost of that convenience.
+      DOCKER_SLSKD_SLSK_PASSWORD: "{{ lookup('env', 'DOCKER_SLSKD_SLSK_PASSWORD') }}"
+  no_log: true
+
+# selectattr, not rejectattr: an unset env var yields '' (verified: type str,
+# length 0, == '' is True), so selectattr('value','equalto','') keeps the MISSING
+# ones. rejectattr would keep the present ones and report nothing missing --
+# which would write a .env with blank secrets and defeat this guard entirely.
+- name: Determine which compose environment secrets are missing
+  ansible.builtin.set_fact:
+    docker_workload_missing_secrets: >-
+      {{ docker_workload_secrets | dict2items
+         | selectattr('value', 'equalto', '')
+         | map(attribute='key')
+         | list }}
+  no_log: true
+
+# A value pasted into the Gitea Actions secret UI often arrives with a trailing
+# newline or a space. Ansible cannot tell the difference between a clean value
+# and a dirty one from the outside: `>-` folding strips whitespace at the end of
+# a YAML scalar, so the rendered .env is clean either way and a check-mode diff
+# would show nothing (no_log suppresses it regardless).
+#
+# The failure is not cosmetic. `key=value\n` in a .env makes compose pass the
+# newline through into the container, and gitea-runner then fails to register
+# against GARAGE_RPC_SECRET with an opaque auth error -- on its next restart,
+# long after the run that wrote it. Assert it here, before the write, and name
+# the key without printing the value.
+#
+# `search`, not `match`: `match` anchors at the start of the string, so it only
+# ever tests the leading edge and silently passes a trailing newline -- which is
+# the overwhelmingly common case, since that is what the Gitea secret UI adds.
+# Verified: 'match' returns 0 hits on "hunter2  \n", `search` returns 1.
+- name: Determine which compose environment secrets have surrounding whitespace
+  ansible.builtin.set_fact:
+    docker_workload_padded_secrets: >-
+      {{ docker_workload_secrets | dict2items
+         | selectattr('value', 'search', '^\s|\s$')
+         | map(attribute='key')
+         | list }}
+  no_log: true
+
+- name: Fail if a compose environment secret has surrounding whitespace
+  ansible.builtin.assert:
+    that: docker_workload_padded_secrets | length == 0
+    fail_msg: >-
+      Refusing to write {{ docker_workload_dir }}/.env: no value was supplied
+      cleanly for {{ docker_workload_padded_secrets | join(', ') }}. A leading or
+      trailing space or newline in a secret will be written into the .env and
+      break the service on its next restart, so fix the value in Gitea (no
+      trailing whitespace) and re-run.
+    success_msg: all supplied secrets are free of surrounding whitespace
+  when: docker_workload_padded_secrets | length > 0
+
+# Writing a .env with blank secrets would break gitea-runner registration and
+# Garage's RPC authentication on the next restart -- silently, and long after the
+# run that caused it. If a secret is absent, leave the existing file alone.
+- name: Report missing compose environment secrets
+  ansible.builtin.debug:
+    msg: >-
+      Not deploying {{ docker_workload_dir }}/.env: no value was supplied for
+      {{ docker_workload_missing_secrets | join(', ') }}. The existing .env is
+      left untouched so the stack keeps running. Add the secret(s) to the Gitea
+      Actions repository and re-run to adopt it.
+  when: docker_workload_missing_secrets | length > 0
+
+- name: Deploy the compose environment file
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ docker_workload_dir }}/.env"
+    mode: "0600"
+  no_log: true
+  when: docker_workload_missing_secrets | length == 0
+
+# ---------------------------------------------------------------------------
+# Compose project files
+# ---------------------------------------------------------------------------
+
+# Modes are the host's existing 0664, so adoption is a no-op on permissions.
+- name: Deploy the compose file
+  ansible.builtin.copy:
+    src: "{{ docker_workload_src }}/docker-compose.yml"
+    dest: "{{ docker_workload_dir }}/docker-compose.yml"
+    mode: "0664"
+
+- name: Deploy the Garage configuration
+  ansible.builtin.copy:
+    src: "{{ docker_workload_src }}/garage/config.toml"
+    dest: "{{ docker_workload_dir }}/garage/config.toml"
+    mode: "0664"
+  notify: Restart Garage
+
+# Converge the stack on every run, not only when a file changes. `compose up` is
+# a no-op when the declared state already matches, so the cost of running it
+# unconditionally is one pass of container inspection.
+#
+# This was a handler, notified by the file deploys, and that was wrong twice
+# over. A handler only fires when something reported changed, so a run whose
+# files were all already correct performed no reconcile at all -- which is
+# exactly the case after a fix to this task lands, or after any interrupted
+# run. It also meant the .env written on one run was not applied until some
+# *later* run happened to rewrite a file: compose resolves env_file into the
+# container config, so the services kept running with the previous values. The
+# registration token in .env was on disk for hours while gitea-runner still
+# held the old one.
+#
+# `--pull` belongs AFTER `up`. Compose has no top-level --pull flag, so
+# `docker compose --pull missing -f FILE up -d` exits non-zero with
+# `unknown flag: --pull` before looking at a container. Verified against
+# compose v5.1.4 on the host.
+#
+# --remove-orphans removes containers not in this compose file. Safe only
+# because the compose file here is the full declaration of the stack; if a
+# service is ever moved out of it, remove it from the stack deliberately first
+# or this will delete its data.
+- name: Reconcile the compose stack
+  ansible.builtin.command:
+    argv:
+      - docker
+      - compose
+      - -f
+      - "{{ docker_workload_dir }}/docker-compose.yml"
+      - up
+      - --pull
+      - "{{ docker_workload_pull_policy }}"
+      - -d
+      - --remove-orphans
+  register: docker_compose_up
+  changed_when: >-
+    'Creating' in docker_compose_up.stdout or 'Recreating' in docker_compose_up.stdout
+  # command is skipped under --check, so this is `skipped` in a dry run. That
+  # is fine: it means the dry run reports the desired change from the copy and
+  # template tasks above, but it cannot show what compose itself would do. To
+  # see that, run it by hand with --dry-run appended.
+
+# ---------------------------------------------------------------------------
+# Restic host backup
+# ---------------------------------------------------------------------------
+
+# 0755 is the host's existing mode. The files inside are already 0600/0700;
+# this role does not tighten the directory itself during adoption.
+- name: Ensure the restic configuration directory exists
+  ansible.builtin.file:
+    path: "{{ docker_backup_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the restic backup script
+  ansible.builtin.copy:
+    src: "{{ docker_workload_src }}/restic/backup.sh"
+    dest: "{{ docker_backup_dir }}/backup.sh"
+    mode: "{{ docker_backup_script_mode }}"
+  notify: Restart the restic backup service
+
+- name: Deploy the restic systemd units
+  ansible.builtin.copy:
+    src: "{{ docker_workload_src }}/restic/{{ item }}"
+    dest: "{{ docker_backup_unit_dir }}/{{ item }}"
+    mode: "{{ docker_backup_unit_mode }}"
+  loop: "{{ docker_backup_units }}"
+  notify:
+    - Reload systemd
+    - Restart the restic backup service
+
+# restic_env holds the repository URL and credentials; paths holds the source
+# list. Both are root-only, so their contents cannot be read and therefore
+# cannot be templated without guessing -- and a wrong guess silently changes
+# what gets backed up. Assert they exist rather than taking ownership.
+- name: Check the hand-managed restic configuration
+  ansible.builtin.stat:
+    path: "{{ docker_backup_dir }}/{{ item }}"
+  loop: "{{ docker_backup_unmanaged_files }}"
+  register: docker_backup_unmanaged_stat
+  changed_when: false
+
+- name: Fail if a hand-managed restic configuration file is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item }} is missing from {{ docker_backup_dir }}. It is not managed
+      by this repository, so restore it before re-enabling
+      {{ docker_backup_timer }} -- deploying the script and units without their
+      inputs produces a timer that fails at 03:00.
+  loop: "{{ docker_backup_unmanaged_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not item.stat.exists
+
+- name: Enable and start the restic backup timer
+  ansible.builtin.systemd:
+    name: "{{ docker_backup_timer }}"
+    enabled: true
+    state: started
+    daemon_reload: true

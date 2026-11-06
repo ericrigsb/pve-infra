@@ -1,0 +1,205 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traefik-values
+  namespace: traefik
+data:
+  values.yaml: |
+    deployment:
+      # Two replicas, held apart by the hard podAntiAffinity below, so a
+      # node-level eviction can take down at most one of them. With a single
+      # replica the node's ephemeral-storage eviction cost the whole estate its
+      # ingress for 13s on 2026-10-16 07:55 (evicted 07:55:34, replacement Ready
+      # 07:55:47), and the 12 evicted traefik pods before it show this recurs.
+      # The hand-written `traefik-pdb` (maxUnavailable: 1) only becomes
+      # meaningful at this size: it is what lets a drain take one replica and
+      # still have the other serving.
+      replicas: 2
+
+      # Traefik's buffering middleware (vulcand/oxy -> mailgun/multibuf) spools
+      # request AND response bodies larger than its ~2 MiB in-memory threshold
+      # into `temp-multibuf-*` files under /tmp. /tmp is the `tmp` emptyDir, so
+      # those files live on NODE disk, and they are not always removed when a
+      # transfer is aborted -- they accumulate until the pod is recreated.
+      #
+      # Observed 2026-10-16: traefik's two pods held 3.46 GB of orphans on cp-02
+      # and 2.49 GB + 2.56 GB on worker-01 (~8.5 GB total). It is nodefs usage
+      # that trips cp-01's `nodefs.available < 10%` eviction threshold, and
+      # kubelet then evicts the pod with the highest usage-above-request, which
+      # is traefik -- the 13s ingress outage. The `limit-buffering` Middleware
+      # caps the request side at 2 GiB, but the response side is deliberately
+      # uncapped (a cap would 413 large garage/nextcloud downloads), so this
+      # sidecar is what bounds the spills.
+      #
+      # It is a sidecar sharing the same `tmp` emptyDir rather than a hostPath
+      # DaemonSet because this namespace falls under the cluster's enforced
+      # PodSecurity `baseline` level, which forbids hostPath volumes -- the
+      # DaemonSet form was rejected by admission ("violates PodSecurity
+      # baseline:latest: hostPath volumes") and never started. A sidecar needs
+      # neither hostPath nor a privileged namespace, and it sweeps exactly the
+      # directory that leaks.
+      #
+      # The 30 minute age guard leaves healthy in-flight transfers alone;
+      # unlinking a file that is still open is safe on Linux, because the
+      # directory entry goes away while the writer keeps the inode alive until
+      # it closes, and the space is reclaimed then.
+      additionalContainers:
+        - name: tmp-sweep
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                find /mnt/tmp -maxdepth 1 -name 'temp-multibuf-*' -mmin +30 -print 2>/dev/null \
+                  | while IFS= read -r f; do
+                      echo "sweep: removing $(stat -c %s "$f" 2>/dev/null || echo '?') byte leftover $f"
+                      rm -f "$f"
+                    done
+                sleep 300
+              done
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+              ephemeral-storage: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /mnt/tmp
+
+    # NOTE: this must be top-level `resources`. The traefik chart only reads
+    # `.Values.resources` (_podtemplate.tpl) and derives GOMEMLIMIT from it, so
+    # a `deployment.resources` key is silently ignored and the pod runs
+    # BestEffort -> first eviction victim for ANY node pressure. No CPU limit on
+    # purpose: this is the cluster ingress.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+        # Memory requests alone did NOT stop the evictions: the 2026-10-16
+        # event was for EPHEMERAL-storage, where traefik still read
+        # "request is 0". kubelet ranks eviction candidates by usage minus
+        # request, and every pod in this cluster declared an ephemeral-storage
+        # request of 0, so traefik's emptyDir (data, tmp) made it the first
+        # victim. Declaring a request demotes ingress to last in that ordering.
+        # Deliberately no limit: a limit would hand kubelet a fresh reason to
+        # kill the single entry point every other app depends on.
+        ephemeral-storage: 128Mi
+      limits:
+        memory: 512Mi
+
+    # The chart only adds pod anti-affinity by itself when hostNetwork is true
+    # (to avoid port collisions), which we do not use -- so at replicas: 2 both
+    # replicas can otherwise land on the same node and be evicted together,
+    # which would defeat the whole point of the second replica. Control planes
+    # are schedulable here (allowSchedulingOnControlPlanes), so a replica may be
+    # placed there; that is fine, since the guarantee we need is simply that
+    # the two are not on the same host.
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: traefik
+            topologyKey: kubernetes.io/hostname
+
+    service:
+      enabled: true
+      type: LoadBalancer
+      annotations:
+        external-dns.alpha.kubernetes.io/hostname: traefik.mesh.rigsb.net
+        external-dns.alpha.kubernetes.io/target: 10.0.4.100
+      spec:
+        externalTrafficPolicy: Cluster
+        loadBalancerIP: 10.0.4.100
+
+    ports:
+      traefik:
+        port: 9000
+        expose:
+          default: false
+        exposedPort: 9000
+      web:
+        port: 80
+        expose:
+          default: true
+        exposedPort: 80
+      websecure:
+        port: 443
+        expose:
+          default: true
+        exposedPort: 443
+      mailrise:
+        port: 8025
+        expose:
+          default: true
+        exposedPort: 8025
+      unifi8080:
+        port: 8080
+        expose:
+          default: true
+        exposedPort: 8080
+      unifi8880:
+        port: 8880
+        expose:
+          default: true
+        exposedPort: 8880
+      unifi3478:
+        port: 3478
+        expose:
+          default: true
+        exposedPort: 3478
+        protocol: UDP
+      unifi10001:
+        port: 10001
+        expose:
+          default: true
+        exposedPort: 10001
+        protocol: UDP
+      winbox:
+        port: 8291
+        expose:
+          default: true
+        exposedPort: 8291
+
+    entryPoints:
+      traefik:
+        address: ":9000"
+      web:
+        address: ":80"
+      websecure:
+        address: ":443"
+      mailrise:
+        address: ":8025"
+      unifi8080:
+        address: ":8080"
+      unifi8880:
+        address: ":8880"
+      unifi3478:
+        address: ":3478/udp"
+      unifi10001:
+        address: ":10001/udp"
+      winbox:
+        address: ":8291"
+
+    providers:
+      kubernetesCRD:
+        enabled: true
+      kubernetesIngress:
+        enabled: true
+        publishedService:
+          enabled: true
+
+    additionalArguments:
+      - "--providers.kubernetescrd.allowCrossNamespace=true"
+      - "--entryPoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entryPoints.web.http.redirections.entryPoint.scheme=https"

@@ -1,0 +1,450 @@
+# Cockpit file-sharing role -- owns the file-server PACKAGE layer and asserts
+# (never deploys) the NFS exports on a host running the 45Drives Cockpit
+# add-ons.
+#
+# Used by both `backup` (LXC 101) and `docker` (VM 100). Per-host values live
+# in vars/ and are loaded explicitly below; this file is host-agnostic.
+#
+# The per-host files are NOT in a host_vars/ directory on purpose. ansible.sh
+# invokes this with `-i "$IP,"`, so inventory_hostname is a bare IP (10.0.4.8,
+# 10.0.4.10) and never "backup" or "docker". Ansible only auto-loads host_vars/
+# when it sits beside the playbook, so a role-local host_vars/ would never be
+# picked up -- and an implicit lookup keyed on an IP is the wrong key anyway.
+# Each playbook names its own vars file explicitly instead.
+#
+# What this role deliberately does NOT own -- all app-managed, and adopting any
+# of it is a one-way door (AGENTS.md #11/#12):
+#
+#   * /etc/exports.d/cockpit-file-sharing.exports -- the NFS exports, generated
+#     and rewritten by the Cockpit file-sharing UI, carrying UI-invented
+#     -fsid=<uuid> values. This role NEVER writes an exports file. It reads the
+#     UI's file and FAILS if it disagrees with vars/, so drift shows up in CI.
+#     It does not "fix" the UI's file: exportfs(5) reads every *.exports in the
+#     directory, so writing a second one alongside means two sources of truth
+#     and any export removed in the UI silently stays exported. That was the
+#     earlier design here and it was wrong.
+#   * /var/lib/samba/private/registry.tdb -- Samba shares live here because
+#     smb.conf says `include = registry`. NOT templateable without first
+#     migrating the shares out of the registry. Never read, never written.
+#     Unused on `backup`; IN USE on `docker`, which is why that host is not
+#     rebuildable from git.
+#   * the cockpit-identities user database -- left strictly alone.
+#
+# Data mounts are asserted, never mounted. They differ per host: `backup`'s is
+# NTFS propagated in from pve2, `docker`'s is ext4 from its own fstab. See
+# host_vars and the README.
+
+- name: Fail if the playbook did not name a per-host vars file
+  # Checked BEFORE include_vars so a typo or a forgotten argument produces an
+  # actionable message instead of include_vars failing on a missing path.
+  ansible.builtin.assert:
+    that:
+      - cockpit_files_vars_file is defined
+      - cockpit_files_vars_file | length > 0
+    fail_msg: >-
+      This playbook runs the cockpit_files role but does not set
+      `cockpit_files_vars_file`. Add:
+          vars_files:
+            - roles/cockpit_files/vars/<hostname>.yml
+      next to the role in this playbook. Silently exporting nothing is the one
+      outcome that must never happen here.
+    quiet: true
+
+- name: Load this host's file-sharing settings
+  ansible.builtin.include_vars:
+    file: "{{ cockpit_files_vars_file }}"
+  # Relative to this role's vars/ directory, so callers pass a path relative to
+  # the role. The included file defines cockpit_files_exports,
+  # cockpit_files_data_mountpoints and cockpit_files_addon_debs.
+
+- name: Fail if this host has no file-sharing configuration
+  ansible.builtin.assert:
+    that:
+      - cockpit_files_exports is defined and cockpit_files_exports | length > 0
+      - cockpit_files_data_mountpoints is defined and cockpit_files_data_mountpoints | length > 0
+      - cockpit_files_addon_debs is defined and cockpit_files_addon_debs | length > 0
+    fail_msg: >-
+      {{ cockpit_files_vars_file }} is loaded but is missing cockpit_files_exports,
+      cockpit_files_data_mountpoints or cockpit_files_addon_debs, so there is
+      nothing (or not enough) for this role to manage. Every host using this role
+      must declare at least one export, one mountpoint, and its own add-on set.
+      cockpit_files_addon_debs has no default precisely because the versions are
+      per host and installing the wrong one downgrades a working plugin.
+      Silently exporting nothing is the one outcome that must never happen here.
+    quiet: true
+
+- name: Check each data mountpoint is a real mount
+  ansible.builtin.command:
+    cmd: findmnt --noheadings --output TARGET --mountpoint {{ item }}
+  loop: "{{ cockpit_files_data_mountpoints }}"
+  loop_control:
+    label: "{{ item }}"
+  register: cockpit_files_mounts
+  changed_when: false
+  check_mode: false
+  # `check_mode: false` on a READ-ONLY command. Without it Ansible skips every
+  # `command` task under --check, so this assertion would silently pass in CI's
+  # check-playbooks dry run -- and a green dry run over an unmounted disk is the
+  # exact failure this task exists to catch. `changed_when: false` keeps it from
+  # reporting a change. Nothing here writes; see AGENTS.md, the check-playbooks
+  # note in .gitea/workflows/provision.yml.
+
+- name: Fail if findmnt itself could not be run
+  # findmnt exits 1 for "that path is not a mountpoint" and something else
+  # (2 here) for "I could not check" -- missing binary, unrecognised option.
+  # Collapsing those two would report a broken check as a dead disk, so
+  # separate them. Verified present on both hosts: rc=1 for a non-mountpoint
+  # path on 10.0.4.10 and 10.0.4.8.
+  ansible.builtin.fail:
+    msg: >-
+      Could not determine whether {{ item.item }} is mounted: findmnt exited
+      {{ item.rc }} rather than 1 (1 means "not a mountpoint"). This is a
+      problem with the check itself, not necessarily with the disk. Do not
+      assume the data disk is fine because this role stopped here.
+      stderr: {{ item.stderr | default('(none)') | trim }}
+  loop: "{{ cockpit_files_mounts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc | default(0) != 0 and item.rc | default(0) != 1
+
+- name: Fail if a data mountpoint is not mounted
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item }} is not a mountpoint, so the exports below would be
+      currently empty. Every restic repository on `backup` lives behind
+      /mnt/backup, and ten cluster PVs live behind /mnt/share, so this fails
+      apps outright rather than degrading them.
+      This role cannot mount it. On `backup` the filesystem is NTFS mounted
+      with ntfs-3g on the Proxmox host pve2 and propagated into the container,
+      which has no block devices, no /lib/modules and no /dev/fuse. On `docker`
+      it is the USB passthrough disk, mounted from the VM's own fstab by UUID.
+      Fix it on the host -- see the role README.
+  loop: "{{ cockpit_files_mounts.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc | default(0) == 1
+
+- name: Install the native file-sharing packages
+  ansible.builtin.apt:
+    name: "{{ cockpit_files_native_packages }}"
+    state: present
+    update_cache: true
+  # `state: present` never upgrades. The two hosts run different Cockpit
+  # majors (287 on bookworm, 314 on noble) and both work; converging them
+  # would mean picking a version for a host that is currently fine.
+
+- name: Read the add-on versions currently installed on this host
+  # So the role can compare the vendored set against what the host actually
+  # runs, instead of discovering a mismatch by downgrading something.
+  ansible.builtin.command:
+    cmd: dpkg-query -W -f=${Version} {{ item.name }}
+  loop: "{{ cockpit_files_addon_debs }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: cockpit_files_installed
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  # NOT `failed_when: item.rc != 0`. Inside a loop, `item` is the loop item (the
+  # deb dict), not the command result, so `item.rc` does not exist -- that
+  # errored on both hosts. The per-item command result is only available from
+  # the registered `results` below, which is where both checks now live.
+  # `failed_when: false` because dpkg-query exits non-zero for a package that
+  # is not installed, and that is a state to report with a useful message rather
+  # than an opaque task failure.
+
+- name: Work out which vendored add-ons this host does not already run
+  # The three-way split this role is built on, decided from the dpkg-query read
+  # above:
+  #
+  #   rc != 0                    -> NOT INSTALLED. This is the fresh-rebuild
+  #                                 case, and it is the ONLY case where the
+  #                                 install below has anything to do.
+  #   rc == 0, version == pinned -> already correct, nothing to do.
+  #   rc == 0, version != pinned -> a working add-on at a different version.
+  #                                 Never install over it; the guard below fails.
+  #
+  # An earlier version FAILED on the first case instead of installing. That made
+  # the install tasks unreachable, so a fresh host could never be rebuilt from
+  # git -- the role asserted the add-ons existed and then had no way to put them
+  # back. Verified against all three shapes: live hosts select nothing, a fresh
+  # host selects all three, a drifted host selects nothing.
+  ansible.builtin.set_fact:
+    cockpit_files_addons_to_install: "{{ cockpit_files_installed.results | selectattr('rc', 'ne', 0) | map(attribute='item') | list }}"
+
+- name: Report what the add-on layer is doing on this host
+  ansible.builtin.debug:
+    msg: >-
+      {{ cockpit_files_installed.results | length }} vendored add-on(s);
+      {{ cockpit_files_addons_to_install | length }} to install
+      ({{ cockpit_files_addons_to_install | map(attribute='name') | join(', ') | default('none', true) }});
+      the rest already run at their pinned versions.
+
+- name: Fail if the vendored set disagrees with what this host runs
+  # The whole point of per-host version pinning: `backup` runs file-sharing
+  # 4.2.10 and `docker` runs 4.2.12. If the vendored set ever stops matching
+  # the host, this role would reinstall a DIFFERENT version of the plugin that
+  # owns this host's exports and its Samba shares. Verified identical on both
+  # hosts as of 2026-10-02.
+  #
+  # Compared against the `version` recorded in vars/, not a version parsed out
+  # of the filename: a filename regex is fragile and, tested, silently never
+  # matched. The var is stated explicitly so it is readable and reviewable.
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item.name }}: this host has {{ item.stdout | trim }} installed,
+      but vars/{{ cockpit_files_vars_file | basename }} pins
+      {{ item.item.version }} (from {{ item.item.file }}).
+      Installing that would CHANGE a working add-on -- a downgrade on
+      `docker` (4.2.12 is newer than what is vendored) or an upgrade on
+      `backup`. There is deliberately no `allow_downgrade`, so apt may refuse
+      outright, but do not rely on that: decide deliberately which version this
+      host should run, re-vendor the deb, and update `version` and `sha256` in
+      vars/.
+  loop: "{{ cockpit_files_installed.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - item.rc == 0
+    - item.stdout | trim != item.item.version
+
+- name: Verify the vendored add-on packages
+  ansible.builtin.stat:
+    path: "{{ cockpit_files_debs_dir }}/{{ item.file }}"
+    checksum: sha256
+    get_checksum: true
+  loop: "{{ cockpit_files_addon_debs }}"
+  loop_control:
+    label: "{{ item.name }} ({{ item.file }})"
+  delegate_to: localhost
+  become: false
+  register: cockpit_files_debs
+  changed_when: false
+  # Controller-side check, so it MUST delegate to localhost: these files exist
+  # only in this repository's checkout on the CI runner, never on the guest.
+  # The path is role_path/files/debs, NOT playbook_dir/files/debs --
+  # playbook_dir is ansible/playbooks, so the earlier version looked for
+  # ansible/playbooks/files/debs/ and found nothing on either host. `role_path`
+  # is the role's own directory. See defaults/main.yml.
+  #
+  # ALL vendored debs are verified every run, not just the ones about to be
+  # installed. Both live hosts already run their pinned versions, so
+  # `cockpit_files_addons_to_install` is empty and scoping this to it meant the
+  # check never ran -- a corrupted file in git would have gone unnoticed until
+  # some host happened to need that package. Hashing 7.8MB is cheap next to
+  # knowing the repository holds what it claims to hold.
+
+- name: Fail if a vendored add-on is missing or corrupt
+  ansible.builtin.fail:
+    msg: >-
+      {{ item.item.file }} is missing or does not match its recorded sha256.
+      Refusing to install an unverified package. Looked in
+      {{ cockpit_files_debs_dir }} on the controller.
+      Expected {{ item.item.sha256 }},
+      got {{ item.stat.checksum | default('nothing') }}.
+  loop: "{{ cockpit_files_debs.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: not item.stat.exists or item.stat.checksum != item.item.sha256
+
+- name: Ensure the add-on staging directory exists
+  ansible.builtin.file:
+    path: "{{ cockpit_files_stage_dir }}"
+    state: directory
+    mode: "0755"
+  when: cockpit_files_addons_to_install | length > 0
+  # `copy` does NOT create the destination directory, and nothing else on these
+  # hosts creates it -- /var/cache/cockpit-files-addons does not exist on either.
+  # Verified: without this task the stage step fails with "Destination directory
+  # ... does not exist" on a host that genuinely needs an add-on installed.
+  # Skipped when there is nothing to install, so a converged host is untouched.
+  # Not check_mode-guarded: creating an empty dir is the one write that makes a
+  # dry run's "3 to install" report honest, and it is inert.
+
+- name: Stage the vendored add-on packages on the guest
+  # Copy rather than handing apt a controller-side path: apt would look for the
+  # .deb on the guest, which does not have it. Staged to a cache dir so a
+  # verified deb is what actually gets installed.
+  #
+  # Skipped under --check, which matters: `copy` does not actually write in check
+  # mode, so the `apt` task below would then be handed a path that does not
+  # exist and fail with a misleading "No package matching ... is available".
+  # That is a check-mode artifact, not a broken package. See the check-playbooks
+  # note in .gitea/workflows/provision.yml.
+  ansible.builtin.copy:
+    src: "{{ cockpit_files_debs_dir }}/{{ item.file }}"
+    dest: "{{ cockpit_files_stage_dir }}/{{ item.file }}"
+    mode: "0644"
+  loop: "{{ cockpit_files_addons_to_install }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+
+- name: Install the Cockpit add-ons
+  ansible.builtin.apt:
+    name: "{{ cockpit_files_stage_dir }}/{{ item.file }}"
+    state: present
+  loop: "{{ cockpit_files_addons_to_install }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: not ansible_check_mode
+  # No `allow_downgrade`. The vendored set is per-host (see vars/): the `docker`
+  # host runs file-sharing 4.2.12 and `backup` runs 4.2.10. If either host is
+  # ahead of what is vendored, apt refusing is the correct outcome -- it means
+  # the vendored set is stale for that host. In practice the drift guard above
+  # fails first, so this only ever runs on a host that is missing the add-on.
+  #
+  # NOT exercised by CI: both live hosts already run these add-ons at the pinned
+  # versions, so this loop is empty there and the dry run cannot prove the
+  # install works. First real exercise will be a genuine rebuild.
+
+- name: Remove the staged add-on packages
+  ansible.builtin.file:
+    path: "{{ cockpit_files_stage_dir }}/{{ item.file }}"
+    state: absent
+  loop: "{{ cockpit_files_addons_to_install }}"
+  loop_control:
+    label: "{{ item.file }}"
+  changed_when: false
+
+- name: Ensure Cockpit is enabled and running
+  ansible.builtin.systemd_service:
+    name: cockpit.socket
+    enabled: true
+    state: started
+  # `state: started` does not restart an already-running socket. Never restart
+  # nfs-server or smbd -- see handlers/main.yml.
+
+- name: Ensure the NFS server is enabled
+  ansible.builtin.systemd_service:
+    name: nfs-server
+    enabled: true
+  # enabled but not started/restarted: starting is idempotent, restarting is
+  # not, and this host exports paths that live PVs depend on.
+
+- name: Ensure the Samba server is enabled
+  ansible.builtin.systemd_service:
+    name: smbd
+    enabled: true
+
+- name: Read the exports the Cockpit add-on currently manages
+  # The UI owns these. This role does NOT write an exports file -- it only
+  # checks that what the UI has matches what git records, so the two cannot
+  # silently drift. See the README and AGENTS.md #12.
+  ansible.builtin.slurp:
+    src: "{{ cockpit_files_ui_exports_file }}"
+  register: cockpit_files_ui_exports
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  # `failed_when: false` so a missing file becomes a readable failure below
+  # rather than an opaque slurp error. `check_mode: false` because this is a
+  # READ: under --check Ansible would skip it entirely and the comparison below
+  # would compare against nothing and pass.
+
+- name: Fail if the Cockpit add-on's exports file is missing
+  ansible.builtin.fail:
+    msg: >-
+      {{ cockpit_files_ui_exports_file }} does not exist, so this host is
+      currently exporting nothing, while
+      vars/{{ cockpit_files_vars_file | basename }} says it should be exporting
+      {{ cockpit_files_exports | length }} path(s):
+      {{ cockpit_files_exports | map(attribute='path') | join(', ') }}
+      This role deliberately does not create the file. The Cockpit
+      file-sharing UI owns it, and writing a second exports file alongside
+      means exportfs(5) reads both -- so an export removed in the UI stays
+      exported anyway and the removal silently does nothing (AGENTS.md #12).
+      Recreate the exports in the UI, then re-run.
+  when: cockpit_files_ui_exports.failed
+
+- name: Reduce both sides to the same canonical form
+  # Normalises the UI's file and git's vars to one comparable shape so the
+  # assertion below is about CONTENT and never about formatting.
+  #
+  # Normalised away, and only these:
+  #   * whole-line comments and blank lines  -- the UI writes its own
+  #   * trailing inline comments, e.g. `... no_subtree_check) # Backup` -- the
+  #     UI appends the share's display name as a `#`-comment after the options
+  #     on the SAME line, confirmed live on both hosts (the `Backup`/`Music`
+  #     share names). An earlier version of this only skipped whole-line `#`
+  #     comments, so this trailing comment was treated as two more tokens
+  #     ("#" and the name) and sorted into the comparison, failing CI on both
+  #     hosts despite the exports actually matching.
+  #   * -fsid=<uuid>                         -- invented per export by the UI;
+  #     nothing in git references fsid, because all 15 NFS PVs mount by
+  #     server+path
+  #   * the ORDER of options within (rw,async) -- semantically irrelevant to
+  #     exportfs, so a reordered list in the UI is not drift
+  #
+  # NOT normalised: export paths, client lists, and the option SET. A real
+  # difference still fails.
+  #
+  # Written as one Jinja block rather than a shell pipeline so it behaves
+  # identically on a Debian container and an Ubuntu VM, and so the whole
+  # transformation is readable in a single place.
+  #
+  # The `{%- -%}` whitespace control is load-bearing, not style. Without it the
+  # folded block renders to a leading space followed by the dict, and Ansible
+  # only restores a templated result to its real type when the output starts
+  # with `{` or `[` (it safe_evals it). A leading space means it silently comes
+  # back as a STRING, and `cockpit_files_canon.live` below then fails with
+  # "has no attribute 'live'" -- or worse, compares as equal to nothing.
+  #
+  # `partition('(')` rather than `regex_search` with backreferences: that filter
+  # takes its '\\1'/'\\2' group arguments only when called as a direct
+  # expression, and raises "Unknown argument" from inside a {% %} block.
+  ansible.builtin.set_fact:
+    cockpit_files_canon: >-
+      {%- set canon = [] -%}
+      {%- for line in (cockpit_files_ui_exports.content | default('') | b64decode).splitlines() -%}
+      {%-   set text = line | trim -%}
+      {%-   if text and not text.startswith('#') -%}
+      {%-     set text = text | regex_replace('\s*-fsid=[^,\s)]*', '') -%}
+      {%-     set text = text | regex_replace('\s*#.*$', '') -%}
+      {%-     set words = text.split() -%}
+      {%-     set tokens = [] -%}
+      {%-     for word in words[1:] -%}
+      {%-       set parts = word.partition('(') -%}
+      {%-       if parts[1] -%}
+      {%-         set opts = parts[2] | trim -%}
+      {%-         if opts.endswith(')') -%}{%- set opts = opts[:-1] | trim -%}{%- endif -%}
+      {%-         set opts = opts.split(',') | map('trim') | reject('eq', '') | sort | list -%}
+      {%-         set _ = tokens.append(parts[0] ~ '(' ~ (opts | join(',')) ~ ')') -%}
+      {%-       else -%}
+      {%-         set _ = tokens.append(word) -%}
+      {%-       endif -%}
+      {%-     endfor -%}
+      {%-     set _ = canon.append(words[0] ~ ' ' ~ (tokens | sort | join(' '))) -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- set wanted = [] -%}
+      {%- for export in cockpit_files_exports -%}
+      {%-   set opts = export.options | map('trim') | reject('eq', '') | sort | list -%}
+      {%-   set suffix = '(' ~ (opts | join(',')) ~ ')' -%}
+      {%-   set tokens = export.clients | map('regex_replace', '$', suffix) | sort | list -%}
+      {%-   set _ = wanted.append(export.path ~ ' ' ~ (tokens | join(' '))) -%}
+      {%- endfor -%}
+      {{ {'live': canon | sort, 'wanted': wanted | sort} }}
+
+- name: Report any export the UI and git disagree about
+  # An assertion, not a deployment. The UI is the source of truth; git holds a
+  # copy so drift is visible in CI rather than discovered during an incident.
+  # Every difference is reported, not just the first.
+  ansible.builtin.assert:
+    that:
+      - cockpit_files_canon.live == cockpit_files_canon.wanted
+    fail_msg: >-
+      The Cockpit add-on's {{ cockpit_files_ui_exports_file }} does not match
+      vars/{{ cockpit_files_vars_file | basename }}. Git and the guest disagree
+      about what this host exports.
+      Exported by the UI but not recorded in git:
+      {{ cockpit_files_canon.live | difference(cockpit_files_canon.wanted) | join('  |  ') | default('(none)', true) }}
+      Recorded in git but NOT currently exported:
+      {{ cockpit_files_canon.wanted | difference(cockpit_files_canon.live) | join('  |  ') | default('(none)', true) }}
+      If the UI is right, update vars/{{ cockpit_files_vars_file | basename }} and commit.
+      If git is right, change it in the Cockpit file-sharing UI -- this role
+      will not do that for you, because writing a second exports file means
+      exportfs(5) reads both and the UI's changes lose (AGENTS.md #12).
+      Comments, -fsid values and option ordering are ignored. Paths, clients
+      and the option set are not.
+    quiet: true
